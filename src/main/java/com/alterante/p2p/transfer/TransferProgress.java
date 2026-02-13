@@ -24,6 +24,7 @@ public class TransferProgress {
 
     public long transferredBytes() { return transferredBytes; }
     public long totalBytes() { return totalBytes; }
+    public long startTimeMs() { return startTimeMs; }
 
     public double percentComplete() {
         if (totalBytes == 0) return 100.0;

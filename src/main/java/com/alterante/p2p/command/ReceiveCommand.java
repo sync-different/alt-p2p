@@ -31,20 +31,41 @@ public class ReceiveCommand implements Callable<Integer> {
     @CommandLine.Option(names = {"--output", "-o"}, description = "Output directory", required = true)
     private Path outputDir;
 
+    @CommandLine.Option(names = {"--json"}, description = "Output newline-delimited JSON events instead of human-readable text")
+    private boolean json;
+
     @Override
     public Integer call() throws Exception {
+        try {
+            return doReceive();
+        } catch (Exception e) {
+            if (json) {
+                JsonOutput.error(e.getMessage());
+                return 1;
+            }
+            throw e;
+        }
+    }
+
+    private Integer doReceive() throws Exception {
         InetSocketAddress serverAddr = parseAddress(server);
         PeerConnection conn = new PeerConnection(serverAddr, session, psk);
 
+        if (json) {
+            conn.setStateListener(JsonOutput::status);
+        }
+
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            System.out.println("\nShutting down...");
+            if (!json) System.out.println("\nShutting down...");
             conn.close();
         }));
 
-        System.out.println("Waiting for peer on session '" + session + "' via " + serverAddr + "...");
+        if (!json) System.out.println("Waiting for peer on session '" + session + "' via " + serverAddr + "...");
         conn.connect();
-        System.out.println("Connected! Encrypted P2P link established.");
-        System.out.println("  Remote endpoint: " + conn.remoteEndpoint());
+        if (!json) {
+            System.out.println("Connected! Encrypted P2P link established.");
+            System.out.println("  Remote endpoint: " + conn.remoteEndpoint());
+        }
 
         // Create reliable channel
         int dtlsSendLimit = conn.dtls().transport().getSendLimit();
@@ -53,7 +74,7 @@ public class ReceiveCommand implements Callable<Integer> {
         try {
             FileReceiver receiver = new FileReceiver(outputDir, channel);
 
-            System.out.println("Waiting for file offer...");
+            if (!json) System.out.println("Waiting for file offer...");
 
             // Start receive (blocks until FILE_OFFER arrives, then starts data transfer)
             // We run progress display in a separate thread once we know the file info
@@ -65,9 +86,13 @@ public class ReceiveCommand implements Callable<Integer> {
                         return;
                     }
                 }
-                System.out.println("Receiving: " + receiver.metadata().filename()
-                        + " (" + formatSize(receiver.metadata().fileSize()) + ")");
-                System.out.println("SHA-256: " + receiver.metadata().sha256Hex());
+                if (json) {
+                    JsonOutput.fileInfo(receiver.metadata());
+                } else {
+                    System.out.println("Receiving: " + receiver.metadata().filename()
+                            + " (" + formatSize(receiver.metadata().fileSize()) + ")");
+                    System.out.println("SHA-256: " + receiver.metadata().sha256Hex());
+                }
 
                 // Wait until progress is available (file accepted)
                 while (receiver.progress() == null) {
@@ -76,7 +101,11 @@ public class ReceiveCommand implements Callable<Integer> {
                         return;
                     }
                 }
-                printProgress(receiver.progress());
+                if (json) {
+                    printJsonProgress(receiver.progress());
+                } else {
+                    printProgress(receiver.progress());
+                }
             }, "progress");
             progressThread.setDaemon(true);
             progressThread.start();
@@ -84,12 +113,24 @@ public class ReceiveCommand implements Callable<Integer> {
             receiver.receive();
 
             // Final output
-            System.out.print("\r" + (receiver.progress() != null ? receiver.progress().progressBar(30) : ""));
-            System.out.println();
-            System.out.println("Transfer complete! File saved to: " + receiver.outputFile());
-            System.out.printf("  %s received, %d packets%n",
-                    formatSize(receiver.metadata().fileSize()),
-                    channel.totalPacketsReceived());
+            long durationMs = receiver.progress() != null
+                    ? System.currentTimeMillis() - receiver.progress().startTimeMs()
+                    : 0;
+            if (json) {
+                JsonOutput.complete(
+                        receiver.metadata().fileSize(),
+                        channel.totalPacketsReceived(),
+                        0,
+                        durationMs,
+                        receiver.outputFile().toString());
+            } else {
+                System.out.print("\r" + (receiver.progress() != null ? receiver.progress().progressBar(30) : ""));
+                System.out.println();
+                System.out.println("Transfer complete! File saved to: " + receiver.outputFile());
+                System.out.printf("  %s received, %d packets%n",
+                        formatSize(receiver.metadata().fileSize()),
+                        channel.totalPacketsReceived());
+            }
 
         } finally {
             channel.close();
@@ -104,6 +145,17 @@ public class ReceiveCommand implements Callable<Integer> {
             while (!progress.isComplete()) {
                 System.out.print("\r" + progress.progressBar(30));
                 System.out.flush();
+                Thread.sleep(250);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    private void printJsonProgress(TransferProgress progress) {
+        try {
+            while (!progress.isComplete()) {
+                JsonOutput.progress(progress);
                 Thread.sleep(250);
             }
         } catch (InterruptedException e) {

@@ -31,36 +31,67 @@ public class SendCommand implements Callable<Integer> {
     @CommandLine.Option(names = {"--file", "-f"}, description = "File to send", required = true)
     private Path file;
 
+    @CommandLine.Option(names = {"--json"}, description = "Output newline-delimited JSON events instead of human-readable text")
+    private boolean json;
+
     @Override
     public Integer call() throws Exception {
+        try {
+            return doSend();
+        } catch (Exception e) {
+            if (json) {
+                JsonOutput.error(e.getMessage());
+                return 1;
+            }
+            throw e;
+        }
+    }
+
+    private Integer doSend() throws Exception {
         // Validate file
         if (!Files.exists(file)) {
-            System.err.println("Error: file not found: " + file);
+            String msg = "file not found: " + file;
+            if (json) { JsonOutput.error(msg); return 1; }
+            System.err.println("Error: " + msg);
             return 1;
         }
         if (!Files.isRegularFile(file)) {
-            System.err.println("Error: not a regular file: " + file);
+            String msg = "not a regular file: " + file;
+            if (json) { JsonOutput.error(msg); return 1; }
+            System.err.println("Error: " + msg);
             return 1;
         }
 
         long fileSize = Files.size(file);
-        System.out.println("File: " + file.getFileName() + " (" + formatSize(fileSize) + ")");
-        System.out.println("Computing SHA-256...");
+        if (!json) {
+            System.out.println("File: " + file.getFileName() + " (" + formatSize(fileSize) + ")");
+            System.out.println("Computing SHA-256...");
+        }
         FileMetadata metadata = FileMetadata.fromFile(file);
-        System.out.println("SHA-256: " + metadata.sha256Hex());
+        if (json) {
+            JsonOutput.fileInfo(metadata);
+        } else {
+            System.out.println("SHA-256: " + metadata.sha256Hex());
+        }
 
         InetSocketAddress serverAddr = parseAddress(server);
         PeerConnection conn = new PeerConnection(serverAddr, session, psk);
 
+        if (json) {
+            conn.setStateListener(JsonOutput::status);
+        }
+
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            System.out.println("\nShutting down...");
+            if (!json) System.out.println("\nShutting down...");
             conn.close();
         }));
 
-        System.out.println("Connecting to session '" + session + "' via " + serverAddr + "...");
+        if (!json) System.out.println("Connecting to session '" + session + "' via " + serverAddr + "...");
         conn.connect();
-        System.out.println("Connected! Encrypted P2P link established.");
-        System.out.println("  Remote endpoint: " + conn.remoteEndpoint());
+        if (!json) {
+            System.out.println("Connected! Encrypted P2P link established.");
+            System.out.println("  Remote endpoint: " + conn.remoteEndpoint());
+        }
 
         // Create reliable channel
         int dtlsSendLimit = conn.dtls().transport().getSendLimit();
@@ -70,14 +101,29 @@ public class SendCommand implements Callable<Integer> {
             FileSender sender = new FileSender(file, metadata, channel);
 
             // Progress display thread
-            Thread progressThread = new Thread(() -> printProgress(sender.progress()), "progress");
+            Thread progressThread = new Thread(() -> {
+                if (json) {
+                    printJsonProgress(sender.progress());
+                } else {
+                    printProgress(sender.progress());
+                }
+            }, "progress");
             progressThread.setDaemon(true);
             progressThread.start();
 
             sender.send();
 
-            // Final progress line
-            printFinalProgress(sender.progress(), channel);
+            // Final output
+            long durationMs = System.currentTimeMillis() - sender.progress().startTimeMs();
+            if (json) {
+                JsonOutput.complete(
+                        sender.progress().totalBytes(),
+                        channel.totalPacketsSent(),
+                        channel.totalRetransmissions(),
+                        durationMs);
+            } else {
+                printFinalProgress(sender.progress(), channel);
+            }
 
         } finally {
             channel.close();
@@ -92,6 +138,17 @@ public class SendCommand implements Callable<Integer> {
             while (!progress.isComplete()) {
                 System.out.print("\r" + progress.progressBar(30));
                 System.out.flush();
+                Thread.sleep(250);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    private void printJsonProgress(TransferProgress progress) {
+        try {
+            while (!progress.isComplete()) {
+                JsonOutput.progress(progress);
                 Thread.sleep(250);
             }
         } catch (InterruptedException e) {

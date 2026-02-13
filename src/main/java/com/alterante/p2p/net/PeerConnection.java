@@ -6,6 +6,7 @@ import org.slf4j.LoggerFactory;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.InetSocketAddress;
+import java.util.function.Consumer;
 
 /**
  * Top-level orchestrator for the P2P connection lifecycle.
@@ -21,6 +22,7 @@ public class PeerConnection {
     private final String psk;
 
     private volatile PeerState state = PeerState.INIT;
+    private Consumer<PeerState> stateListener;
     private DatagramSocket socket;
     private InetSocketAddress myPublicEndpoint;
     private InetSocketAddress remoteEndpoint;
@@ -33,6 +35,17 @@ public class PeerConnection {
         this.psk = psk;
     }
 
+    /** Set a listener that is called on every state transition. */
+    public void setStateListener(Consumer<PeerState> listener) {
+        this.stateListener = listener;
+    }
+
+    private void setState(PeerState newState) {
+        this.state = newState;
+        Consumer<PeerState> l = stateListener;
+        if (l != null) l.accept(newState);
+    }
+
     /**
      * Run the full connection flow. Blocks until connected or fails.
      */
@@ -42,15 +55,16 @@ public class PeerConnection {
             log.info("Local socket bound to port {}", socket.getLocalPort());
 
             // Coordination
-            state = PeerState.REGISTERING;
+            setState(PeerState.REGISTERING);
             CoordClient coord = new CoordClient(socket, serverAddr, sessionId, psk);
+            coord.setOnWaitingForPeer(() -> setState(PeerState.WAITING_PEER));
             remoteEndpoint = coord.coordinate();
             myPublicEndpoint = coord.myPublicEndpoint();
 
             log.info("Coordination complete. Remote peer: {}", remoteEndpoint);
 
             // Hole punch
-            state = PeerState.PUNCHING;
+            setState(PeerState.PUNCHING);
             int connId = new java.security.SecureRandom().nextInt();
             HolePuncher puncher = new HolePuncher(socket, remoteEndpoint, connId);
             HolePunchResult result = puncher.punch();
@@ -61,10 +75,13 @@ public class PeerConnection {
             log.info("Hole punch succeeded in {}ms", result.elapsedMs());
 
             // DTLS handshake with retry
-            state = PeerState.HANDSHAKE;
-            boolean isClient = socket.getLocalPort() < remoteEndpoint.getPort();
-            log.info("DTLS role: {} (local={}, remote={})",
-                    isClient ? "CLIENT" : "SERVER", socket.getLocalPort(), remoteEndpoint.getPort());
+            setState(PeerState.HANDSHAKE);
+            // Use public endpoints (exchanged via coord server) for deterministic role assignment.
+            // Both peers see the same pair of public endpoints, so comparing them yields
+            // opposite roles. Using localPort vs remotePort fails when NAT remaps ports.
+            boolean isClient = compareEndpoints(myPublicEndpoint, remoteEndpoint) < 0;
+            log.info("DTLS role: {} (myPublic={}, remotePublic={})",
+                    isClient ? "CLIENT" : "SERVER", myPublicEndpoint, remoteEndpoint);
 
             for (int attempt = 1; attempt <= DTLS_MAX_RETRIES; attempt++) {
                 sendNatKeepalive();
@@ -84,7 +101,7 @@ public class PeerConnection {
                 }
             }
 
-            state = PeerState.CONNECTED;
+            setState(PeerState.CONNECTED);
             log.info("Encrypted P2P link established.");
 
             // Start packet router (handles keepalive + dispatches all packet types)
@@ -92,7 +109,7 @@ public class PeerConnection {
             router.start();
 
         } catch (Exception e) {
-            state = PeerState.ERROR;
+            setState(PeerState.ERROR);
             log.error("Connection failed: {}", e.getMessage());
             throw e;
         }
@@ -108,7 +125,7 @@ public class PeerConnection {
         if (socket != null && !socket.isClosed()) {
             socket.close();
         }
-        state = PeerState.INIT;
+        this.state = PeerState.INIT;
     }
 
     /**
@@ -135,6 +152,21 @@ public class PeerConnection {
         } catch (Exception e) {
             log.debug("Error sending NAT keepalive: {}", e.getMessage());
         }
+    }
+
+    /**
+     * Compare two endpoints deterministically: first by IP address bytes, then by port.
+     * Both peers see the same pair of public endpoints, so this always yields opposite signs.
+     */
+    private static int compareEndpoints(InetSocketAddress a, InetSocketAddress b) {
+        byte[] aAddr = a.getAddress().getAddress();
+        byte[] bAddr = b.getAddress().getAddress();
+        for (int i = 0; i < Math.min(aAddr.length, bAddr.length); i++) {
+            int cmp = (aAddr[i] & 0xFF) - (bAddr[i] & 0xFF);
+            if (cmp != 0) return cmp;
+        }
+        if (aAddr.length != bAddr.length) return aAddr.length - bAddr.length;
+        return Integer.compare(a.getPort(), b.getPort());
     }
 
     public PeerState state() { return state; }

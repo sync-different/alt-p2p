@@ -28,6 +28,7 @@ public class CoordClient {
     private final String sessionId;
     private final String psk;
 
+    private Runnable onWaitingForPeer;
     private InetSocketAddress myPublicEndpoint;
     private InetSocketAddress remoteEndpoint;
 
@@ -64,6 +65,11 @@ public class CoordClient {
         } catch (Exception e) {
             throw new CoordException("Coordination failed: " + e.getMessage(), e);
         }
+    }
+
+    /** Set a callback that fires when entering the wait-for-peer phase. */
+    public void setOnWaitingForPeer(Runnable callback) {
+        this.onWaitingForPeer = callback;
     }
 
     public InetSocketAddress myPublicEndpoint() { return myPublicEndpoint; }
@@ -145,6 +151,7 @@ public class CoordClient {
         }
 
         log.info("Waiting for peer to join session '{}'...", sessionId);
+        if (onWaitingForPeer != null) onWaitingForPeer.run();
 
         // Longer timeout for waiting: the other peer might not have connected yet.
         // We'll poll with the existing timeout, up to 120 seconds total.
