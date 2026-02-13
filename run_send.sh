@@ -1,1 +1,1 @@
-java -Dorg.slf4j.simpleLogger.log.com.alterante.p2p.net.DtlsHandler=debug -jar target/alt-p2p-0.1.0-SNAPSHOT.jar send -f ./alt-p2p-test-1gb.bin --session session26 --psk secret --server 89.144.2.81:9000
+java -Dorg.slf4j.simpleLogger.log.com.alterante.p2p.net.DtlsHandler=debug -jar target/alt-p2p-0.1.0-SNAPSHOT.jar send -f ./alt-p2p-test-1gb.bin --session session27 --psk secret --server 89.144.2.81:9000
