@@ -111,7 +111,7 @@ Minimal server that helps peers find each other:
 ### 2. Sender Application (Java CLI)
 
 ```
-$ java -jar alt-p2p-0.1.0-SNAPSHOT.jar send -s <session-id> --psk <key> --server <host:port> -f <file>
+$ java -jar alt-p2p-0.2.0-SNAPSHOT.jar send -s <session-id> --psk <key> --server <host:port> -f <file>
 
 Options:
   --session, -s    Session ID to join or create (required)
@@ -123,7 +123,7 @@ Options:
 ### 3. Receiver Application (Java CLI)
 
 ```
-$ java -jar alt-p2p-0.1.0-SNAPSHOT.jar receive -s <session-id> --psk <key> --server <host:port> -o <dir>
+$ java -jar alt-p2p-0.2.0-SNAPSHOT.jar receive -s <session-id> --psk <key> --server <host:port> -o <dir>
 
 Options:
   --session, -s    Session ID to join (required)
@@ -1029,7 +1029,7 @@ Type=simple
 User=nobody
 Group=nogroup
 WorkingDirectory=/opt/p2p-coord
-ExecStart=/usr/bin/java -jar alt-p2p-0.1.0-SNAPSHOT.jar server --port 9000 --psk ${PSK}
+ExecStart=/usr/bin/java -jar alt-p2p-0.2.0-SNAPSHOT.jar server --port 9000 --psk ${PSK}
 Restart=always
 RestartSec=5
 
@@ -1075,10 +1075,10 @@ sudo iptables -A INPUT -p udp --dport 9000 -j ACCEPT
 ```dockerfile
 FROM eclipse-temurin:17-jre-alpine
 WORKDIR /app
-COPY target/alt-p2p-0.1.0-SNAPSHOT.jar .
+COPY target/alt-p2p-0.2.0-SNAPSHOT.jar .
 EXPOSE 9000/udp
 ENV PSK=changeme
-CMD ["java", "-jar", "alt-p2p-0.1.0-SNAPSHOT.jar", "server", "--port", "9000", "--psk", "${PSK}"]
+CMD ["java", "-jar", "alt-p2p-0.2.0-SNAPSHOT.jar", "server", "--port", "9000", "--psk", "${PSK}"]
 ```
 
 ```bash
@@ -1138,7 +1138,7 @@ coord.yourdomain.com  AAAA  2001:db8::1
 ```
 
 ```bash
-java -jar alt-p2p-0.1.0-SNAPSHOT.jar send -f file.zip -s mysession --psk secret --server coord.yourdomain.com:9000
+java -jar alt-p2p-0.2.0-SNAPSHOT.jar send -f file.zip -s mysession --psk secret --server coord.yourdomain.com:9000
 ```
 
 ## Running the Application
@@ -1146,13 +1146,13 @@ java -jar alt-p2p-0.1.0-SNAPSHOT.jar send -f file.zip -s mysession --psk secret 
 ### Start Coordination Server
 
 ```bash
-java -jar alt-p2p-0.1.0-SNAPSHOT.jar server --psk mysecret
+java -jar alt-p2p-0.2.0-SNAPSHOT.jar server --psk mysecret
 ```
 
 ### Sender
 
 ```bash
-java -jar alt-p2p-0.1.0-SNAPSHOT.jar send \
+java -jar alt-p2p-0.2.0-SNAPSHOT.jar send \
   -s abc123 --psk mysecret --server coord.example.com:9000 -f myfile.zip
 > Registered with coordination server
 > Waiting for peer...
@@ -1167,7 +1167,7 @@ java -jar alt-p2p-0.1.0-SNAPSHOT.jar send \
 ### Receiver
 
 ```bash
-java -jar alt-p2p-0.1.0-SNAPSHOT.jar receive \
+java -jar alt-p2p-0.2.0-SNAPSHOT.jar receive \
   -s abc123 --psk mysecret --server coord.example.com:9000 -o ./downloads
 > Registered with coordination server
 > Waiting for peer...

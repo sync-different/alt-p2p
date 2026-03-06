@@ -9,7 +9,7 @@ Peers connect through a lightweight coordination server, punch through NATs, est
 ## Build & Test
 
 ```bash
-mvn package          # Build fat JAR → target/alt-p2p-0.1.0-SNAPSHOT.jar
+mvn package          # Build fat JAR → target/alt-p2p-0.2.0-SNAPSHOT.jar
 mvn test             # Run all 84 tests (JUnit 5)
 ```
 
@@ -19,13 +19,13 @@ Requires JDK 17+ and Maven 3.9+.
 
 ```bash
 # Coordination server
-java -jar target/alt-p2p-0.1.0-SNAPSHOT.jar server --psk <key>
+java -jar target/alt-p2p-0.2.0-SNAPSHOT.jar server --psk <key>
 
 # Send a file
-java -jar target/alt-p2p-0.1.0-SNAPSHOT.jar send -s <session> --psk <key> --server <host:port> -f <file>
+java -jar target/alt-p2p-0.2.0-SNAPSHOT.jar send -s <session> --psk <key> --server <host:port> -f <file>
 
 # Receive a file
-java -jar target/alt-p2p-0.1.0-SNAPSHOT.jar receive -s <session> --psk <key> --server <host:port> -o <dir>
+java -jar target/alt-p2p-0.2.0-SNAPSHOT.jar receive -s <session> --psk <key> --server <host:port> -o <dir>
 ```
 
 ## Architecture
@@ -66,6 +66,13 @@ src/main/java/com/alterante/p2p/
 
 - `LinkedHashMap.values().toArray()` is NOT thread-safe. All SlidingWindow access must happen under the same lock.
 - PacketRouter is single-threaded by design — no locking needed on DTLS transport.
+
+### Control Packet Handler Race Condition
+
+- `PacketRouter` starts immediately in `PeerConnection.connect()`, but `FileReceiver`/`FileSender` register their control packet handlers later via `channel.onControlPacket()`.
+- If the remote peer sends `FILE_OFFER` before the handler is registered, the packet is lost and both sides time out ("Timed out waiting for FILE_OFFER" / "Timed out waiting for FILE_ACCEPT").
+- **Fix**: `ReliableChannel` registers control packet type handlers eagerly in its constructor and buffers any that arrive before `onControlPacket()` is called. Buffered packets are replayed when the handler is set.
+- This race is more likely when running as a Tauri sidecar (piped stdout, different thread scheduling) vs terminal.
 
 ### Congestion Control Tuning
 

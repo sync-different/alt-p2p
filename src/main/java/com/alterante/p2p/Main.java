@@ -9,7 +9,7 @@ import picocli.CommandLine;
         name = "alt-p2p",
         description = "P2P file transfer for Alterante",
         mixinStandardHelpOptions = true,
-        version = "0.1.0",
+        version = "0.2.0",
         subcommands = {
                 CoordServerCommand.class,
                 SendCommand.class,

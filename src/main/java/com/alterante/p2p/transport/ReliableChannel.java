@@ -57,6 +57,9 @@ public class ReliableChannel {
     private Consumer<Packet> onControlPacket;
     private Runnable onAllAcked;
 
+    // Buffer for control packets that arrive before the handler is registered
+    private final java.util.Queue<Packet> pendingControlPackets = new java.util.concurrent.ConcurrentLinkedQueue<>();
+
     // State
     private volatile boolean closed;
     private boolean recvBufferInitialized;
@@ -89,6 +92,14 @@ public class ReliableChannel {
         router.addHandler(PacketType.DATA, this::handleData);
         router.addHandler(PacketType.SACK, this::handleSack);
 
+        // Register control packet handlers eagerly so they're buffered if they arrive
+        // before the consumer calls onControlPacket()
+        for (PacketType type : new PacketType[]{
+                PacketType.FILE_OFFER, PacketType.FILE_ACCEPT, PacketType.FILE_REJECT,
+                PacketType.COMPLETE, PacketType.VERIFIED, PacketType.CANCEL}) {
+            router.addHandler(type, this::dispatchControl);
+        }
+
         // Register tick callback for retransmission checks
         router.setTickCallback(this::onTick);
     }
@@ -106,10 +117,11 @@ public class ReliableChannel {
     /** Set callback for control packets (FILE_OFFER, FILE_ACCEPT, COMPLETE, VERIFIED, CANCEL). */
     public void onControlPacket(Consumer<Packet> handler) {
         this.onControlPacket = handler;
-        for (PacketType type : new PacketType[]{
-                PacketType.FILE_OFFER, PacketType.FILE_ACCEPT, PacketType.FILE_REJECT,
-                PacketType.COMPLETE, PacketType.VERIFIED, PacketType.CANCEL}) {
-            router.addHandler(type, this::dispatchControl);
+        // Replay any control packets that arrived before the handler was registered
+        Packet buffered;
+        while ((buffered = pendingControlPackets.poll()) != null) {
+            log.debug("Replaying buffered control packet: {}", buffered.type());
+            handler.accept(buffered);
         }
     }
 
@@ -270,8 +282,12 @@ public class ReliableChannel {
     }
 
     private void dispatchControl(Packet pkt) {
-        if (onControlPacket != null) {
-            onControlPacket.accept(pkt);
+        Consumer<Packet> handler = onControlPacket;
+        if (handler != null) {
+            handler.accept(pkt);
+        } else {
+            log.debug("Buffering control packet (no handler yet): {}", pkt.type());
+            pendingControlPackets.add(pkt);
         }
     }
 
