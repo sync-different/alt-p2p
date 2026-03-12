@@ -23,10 +23,11 @@ public class PacketRouter {
     private static final Logger log = LoggerFactory.getLogger(PacketRouter.class);
 
     private static final int RECEIVE_TIMEOUT_MS = 10;
-    private static final int KEEPALIVE_INTERVAL_MS = 15_000;
-    private static final int KEEPALIVE_DEAD_MS = 45_000;
+    private static final int DEFAULT_KEEPALIVE_INTERVAL_MS = 15_000;
 
     private final DtlsHandler dtls;
+    private final int keepaliveIntervalMs;
+    private final int keepaliveDeadMs;
     private final Map<PacketType, Consumer<Packet>> handlers = new ConcurrentHashMap<>();
     private final ConcurrentLinkedQueue<byte[]> sendQueue = new ConcurrentLinkedQueue<>();
 
@@ -38,7 +39,13 @@ public class PacketRouter {
     private Runnable tickCallback;
 
     public PacketRouter(DtlsHandler dtls) {
+        this(dtls, DEFAULT_KEEPALIVE_INTERVAL_MS);
+    }
+
+    public PacketRouter(DtlsHandler dtls, int keepaliveIntervalMs) {
         this.dtls = dtls;
+        this.keepaliveIntervalMs = keepaliveIntervalMs;
+        this.keepaliveDeadMs = keepaliveIntervalMs * 3; // dead after 3 missed keepalives
     }
 
     /** Register a handler for a specific packet type. */
@@ -144,13 +151,13 @@ public class PacketRouter {
 
                 // 6. Keepalive: send if no data sent recently
                 now = System.currentTimeMillis();
-                if (now - lastSendTimeMs >= KEEPALIVE_INTERVAL_MS) {
+                if (now - lastSendTimeMs >= keepaliveIntervalMs) {
                     doSend(PacketCodec.encode(new Packet(PacketType.KEEPALIVE)));
                     log.debug("Sent keepalive");
                 }
 
                 // 7. Connection dead check
-                if (now - lastRecvTimeMs >= KEEPALIVE_DEAD_MS) {
+                if (now - lastRecvTimeMs >= keepaliveDeadMs) {
                     log.warn("Peer unresponsive for {}ms, declaring connection dead",
                             now - lastRecvTimeMs);
                     running = false;

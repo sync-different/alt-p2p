@@ -10,6 +10,8 @@ public enum PeerState {
     WAITING_PEER,
     PUNCHING,
     HANDSHAKE,
+    RELAYING,
+    RELAY_TCP,
     CONNECTED,
     ERROR
 }

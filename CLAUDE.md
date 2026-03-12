@@ -1,15 +1,17 @@
 # CLAUDE.md
 
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
 ## Project Overview
 
 alt-p2p is an encrypted peer-to-peer file transfer system over UDP with NAT traversal. Built for [Alterante](https://github.com/sync-different/alt-core), a decentralized virtual filesystem.
 
-Peers connect through a lightweight coordination server, punch through NATs, establish a DTLS-encrypted channel, and transfer files with reliable delivery, congestion control, and integrity verification.
+Peers connect through a lightweight coordination server, punch through NATs, establish a DTLS-encrypted channel, and transfer files with reliable delivery, congestion control, and integrity verification. When hole punching fails, a TCP relay mode streams data through the server with TLS-PSK end-to-end encryption.
 
 ## Build & Test
 
 ```bash
-mvn package          # Build fat JAR → target/alt-p2p-0.2.0-SNAPSHOT.jar
+mvn package          # Build fat JAR → target/alt-p2p-0.3.0-SNAPSHOT.jar
 mvn test             # Run all 84 tests (JUnit 5)
 ```
 
@@ -18,14 +20,17 @@ Requires JDK 17+ and Maven 3.9+.
 ## Running
 
 ```bash
-# Coordination server
-java -jar target/alt-p2p-0.2.0-SNAPSHOT.jar server --psk <key>
+# Coordination server (also starts TCP relay on port+1)
+java -jar target/alt-p2p-0.3.0-SNAPSHOT.jar server --psk <key>
 
-# Send a file
-java -jar target/alt-p2p-0.2.0-SNAPSHOT.jar send -s <session> --psk <key> --server <host:port> -f <file>
+# Send a file (direct UDP)
+java -jar target/alt-p2p-0.3.0-SNAPSHOT.jar send -s <session> --psk <key> --server <host:port> -f <file>
+
+# Send with TCP relay fallback (if hole punching fails)
+java -jar target/alt-p2p-0.3.0-SNAPSHOT.jar send -s <session> --psk <key> --server <host:port> -f <file> --allow-relay --relay-mode tcp
 
 # Receive a file
-java -jar target/alt-p2p-0.2.0-SNAPSHOT.jar receive -s <session> --psk <key> --server <host:port> -o <dir>
+java -jar target/alt-p2p-0.3.0-SNAPSHOT.jar receive -s <session> --psk <key> --server <host:port> -o <dir>
 ```
 
 ## Architecture
@@ -33,8 +38,8 @@ java -jar target/alt-p2p-0.2.0-SNAPSHOT.jar receive -s <session> --psk <key> --s
 ```
 src/main/java/com/alterante/p2p/
 ├── Main.java                  # CLI entry point (picocli)
-├── command/                   # CLI subcommands: server, send, receive
-├── net/                       # Networking: coordination, hole punch, DTLS, packet routing
+├── command/                   # CLI subcommands: server, send, receive + TransferOptions
+├── net/                       # Networking: coordination, hole punch, DTLS, packet routing, TCP relay
 ├── protocol/                  # Binary packet format: codec, types, metadata
 ├── transport/                 # Reliable transport: congestion control, sliding window, SACK
 └── transfer/                  # File transfer: sender, receiver, progress, resume
@@ -48,6 +53,9 @@ src/main/java/com/alterante/p2p/
 - **PacketRouter** — Single-threaded I/O loop (10ms tick). All DTLS send/receive on one thread, lock-free send queue
 - **ReliableChannel** — Combines RttEstimator, CongestionControl, SlidingWindow, ReceiveBuffer
 - **FileSender/FileReceiver** — File chunking, auto-accept, SHA-256 verification, resume via `.p2p-partial` sidecar files
+- **TcpRelayServer** — TCP accept loop + dumb byte-copy proxy between paired peers
+- **TcpRelayClient** — TCP connect + HMAC auth + TLS-PSK handshake through proxy
+- **TcpFileSender/TcpFileReceiver** — Stream file over TLS with 64KB chunks, length-prefixed messages
 
 ### Packet Format
 
@@ -90,17 +98,29 @@ src/main/java/com/alterante/p2p/
 - DTLS handshake retries up to 3x with backoff (500ms, 1s, 1.5s), 30s deadline per attempt
 - DTLS role assignment uses **public endpoints** (from coord server), not localPort vs remotePort. NAT remaps ports, so comparing local vs remote can give both peers the same role, deadlocking the handshake.
 
+### TCP Relay Mode
+
+When hole punching fails (symmetric-to-symmetric NAT), peers can fall back to TCP relay through the coordination server. The server acts as a dumb byte-copy proxy — true E2E encryption via TLS-PSK means the server never sees plaintext.
+
+- TCP relay port defaults to UDP port + 1 (e.g., 9001). Configurable via `--tcp-port` on server, `--relay-tcp-port` on client.
+- Auth: peers send a length-prefixed AUTH message with session ID + HMAC-SHA256 before TLS handshake.
+- TLS role assignment: same logic as DTLS — `compareEndpoints(myPublicEndpoint, remoteEndpoint)` determines who is TLS client vs server.
+- `TcpRelayServer.start()` is blocking (like `CoordServer.start()`), so it must run on a daemon thread.
+- BouncyCastle TLS-PSK over TCP uses `TlsClientProtocol`/`TlsServerProtocol` with `ProtocolVersion.TLSv12.only()` (same pattern as DTLS).
+- Performance: ~15 MB/s via TCP relay (28x faster than UDP relay's 530 KB/s), compared to ~5 MB/s SCP to the same VPS.
+- Stream protocol: length-prefixed messages `type(1B) + length(4B BE) + payload`. Types: AUTH, AUTH_OK, FILE_OFFER, FILE_ACCEPT, DATA (64KB), COMPLETE, VERIFIED.
+
 ### JSON IPC Mode
 
 Send and receive commands support `--json` for machine-readable NDJSON output on stdout. Used by the [alt-p2p-ui](https://github.com/sync-different/alt-p2p-ui) Tauri desktop app.
 
-Events: `status`, `file_info`, `progress`, `complete`, `error`, `log`. See `JsonOutput.java` for the format.
+Events: `status`, `file_info`, `progress`, `complete`, `error`, `log`. Status states include `relay_tcp` for TCP relay connections. See `JsonOutput.java` for the format.
 
 ## Development Status
 
 - **Phase 1** (Connectivity + Encryption): Complete
 - **Phase 2** (Reliable Transport): Complete
 - **Phase 3** (File Transfer): Complete (except CANCEL message)
-- **Phase 4** (Hardening): CLI done; relay, IPv6, multi-file pending
+- **Phase 4** (Hardening): CLI done, TCP relay done; IPv6, multi-file pending
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for full design documentation.

@@ -110,6 +110,10 @@ class DtlsHandlerTest {
                 assertNotNull(peerB.dtls(), "Peer B should have DTLS handler");
                 assertNotNull(peerA.router(), "Peer A should have PacketRouter");
                 assertNotNull(peerB.router(), "Peer B should have PacketRouter");
+
+                // Router is no longer auto-started by connect() — callers must start it
+                peerA.startRouter();
+                peerB.startRouter();
                 assertTrue(peerA.router().isRunning(), "Router A should be running");
                 assertTrue(peerB.router().isRunning(), "Router B should be running");
 

@@ -17,20 +17,46 @@ package com.alterante.p2p.transport;
  */
 public class CongestionControl {
 
-    private static final double INITIAL_CWND = 32.0;
-    private static final int INITIAL_SSTHRESH = 2048;
+    private static final double DEFAULT_INITIAL_CWND = 32.0;
+    private static final int DEFAULT_INITIAL_SSTHRESH = 2048;
     private static final int MIN_SSTHRESH = 2;
     private static final int FAST_RETRANSMIT_THRESHOLD = 3;
 
-    private double cwnd = INITIAL_CWND;
-    private int ssthresh = INITIAL_SSTHRESH;
+    private static final int RELAY_CWND = 256;
+
+    private double cwnd;
+    private int ssthresh;
     private int duplicateAckCount;
+    private boolean relayMode;
+
+    public CongestionControl() {
+        this(DEFAULT_INITIAL_CWND);
+    }
+
+    public CongestionControl(double initialCwnd) {
+        this.cwnd = initialCwnd;
+        this.ssthresh = DEFAULT_INITIAL_SSTHRESH;
+    }
+
+    /**
+     * Enable relay mode: fixed large window, no loss-based backoff.
+     * Relay traffic goes through a server, so packet loss is rare and
+     * doesn't indicate congestion.
+     */
+    public void setRelayMode(boolean relay) {
+        this.relayMode = relay;
+        if (relay) {
+            this.cwnd = RELAY_CWND;
+            this.ssthresh = RELAY_CWND;
+        }
+    }
 
     /**
      * Called when a new (non-duplicate) ACK is received.
      */
     public void onAck() {
         duplicateAckCount = 0;
+        if (relayMode) return; // fixed window in relay mode
         if (cwnd < ssthresh) {
             // Slow start: exponential growth
             cwnd += 1.0;
@@ -57,8 +83,14 @@ public class CongestionControl {
 
     /**
      * Called when packet loss is detected (RTO or 3 duplicate ACKs).
+     * In relay mode, loss doesn't shrink the window — the relay path
+     * doesn't congest like a direct UDP link.
      */
     public void onLoss() {
+        if (relayMode) {
+            duplicateAckCount = 0;
+            return;
+        }
         ssthresh = Math.max((int) (cwnd / 2), MIN_SSTHRESH);
         cwnd = ssthresh;
         duplicateAckCount = 0;

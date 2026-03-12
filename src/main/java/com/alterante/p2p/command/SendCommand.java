@@ -3,6 +3,7 @@ package com.alterante.p2p.command;
 import com.alterante.p2p.net.PeerConnection;
 import com.alterante.p2p.transfer.FileMetadata;
 import com.alterante.p2p.transfer.FileSender;
+import com.alterante.p2p.transfer.TcpFileSender;
 import com.alterante.p2p.transfer.TransferProgress;
 import com.alterante.p2p.transport.ReliableChannel;
 import picocli.CommandLine;
@@ -33,6 +34,9 @@ public class SendCommand implements Callable<Integer> {
 
     @CommandLine.Option(names = {"--json"}, description = "Output newline-delimited JSON events instead of human-readable text")
     private boolean json;
+
+    @CommandLine.Mixin
+    private TransferOptions tuning = new TransferOptions();
 
     @Override
     public Integer call() throws Exception {
@@ -76,6 +80,7 @@ public class SendCommand implements Callable<Integer> {
 
         InetSocketAddress serverAddr = parseAddress(server);
         PeerConnection conn = new PeerConnection(serverAddr, session, psk);
+        conn.applyOptions(tuning);
 
         if (json) {
             conn.setStateListener(JsonOutput::status);
@@ -93,41 +98,73 @@ public class SendCommand implements Callable<Integer> {
             System.out.println("  Remote endpoint: " + conn.remoteEndpoint());
         }
 
-        // Create reliable channel
-        int dtlsSendLimit = conn.dtls().transport().getSendLimit();
-        ReliableChannel channel = new ReliableChannel(conn.router(), 0xA, dtlsSendLimit);
+        if (conn.isTcpRelay()) {
+            // TCP relay path — stream file over TLS, no ReliableChannel
+            try {
+                TcpFileSender sender = new TcpFileSender(file, metadata,
+                        conn.tcpRelayInputStream(), conn.tcpRelayOutputStream());
 
-        try {
-            FileSender sender = new FileSender(file, metadata, channel);
+                Thread progressThread = new Thread(() -> {
+                    if (json) {
+                        printJsonProgress(sender.progress());
+                    } else {
+                        printProgress(sender.progress());
+                    }
+                }, "progress");
+                progressThread.setDaemon(true);
+                progressThread.start();
 
-            // Progress display thread
-            Thread progressThread = new Thread(() -> {
+                sender.send();
+
+                long durationMs = System.currentTimeMillis() - sender.progress().startTimeMs();
                 if (json) {
-                    printJsonProgress(sender.progress());
+                    JsonOutput.complete(sender.progress().totalBytes(), 0, 0, durationMs);
                 } else {
-                    printProgress(sender.progress());
+                    System.out.print("\r" + sender.progress().progressBar(30));
+                    System.out.println();
+                    System.out.println("Transfer complete! (TCP relay)");
+                    System.out.printf("  %s sent%n", formatSize(sender.progress().totalBytes()));
                 }
-            }, "progress");
-            progressThread.setDaemon(true);
-            progressThread.start();
-
-            sender.send();
-
-            // Final output
-            long durationMs = System.currentTimeMillis() - sender.progress().startTimeMs();
-            if (json) {
-                JsonOutput.complete(
-                        sender.progress().totalBytes(),
-                        channel.totalPacketsSent(),
-                        channel.totalRetransmissions(),
-                        durationMs);
-            } else {
-                printFinalProgress(sender.progress(), channel);
+            } finally {
+                conn.close();
             }
+        } else {
+            // UDP path — ReliableChannel + FileSender
+            int dtlsSendLimit = conn.dtls().transport().getSendLimit();
+            ReliableChannel channel = new ReliableChannel(conn.router(), 0xA, dtlsSendLimit, conn.initialCwnd());
+            if (conn.allowRelay()) channel.setRelayMode(true);
+            conn.startRouter();
 
-        } finally {
-            channel.close();
-            conn.close();
+            try {
+                FileSender sender = new FileSender(file, metadata, channel);
+
+                Thread progressThread = new Thread(() -> {
+                    if (json) {
+                        printJsonProgress(sender.progress());
+                    } else {
+                        printProgress(sender.progress());
+                    }
+                }, "progress");
+                progressThread.setDaemon(true);
+                progressThread.start();
+
+                sender.send();
+
+                long durationMs = System.currentTimeMillis() - sender.progress().startTimeMs();
+                if (json) {
+                    JsonOutput.complete(
+                            sender.progress().totalBytes(),
+                            channel.totalPacketsSent(),
+                            channel.totalRetransmissions(),
+                            durationMs);
+                } else {
+                    printFinalProgress(sender.progress(), channel);
+                }
+
+            } finally {
+                channel.close();
+                conn.close();
+            }
         }
 
         return 0;

@@ -2,6 +2,7 @@ package com.alterante.p2p.command;
 
 import com.alterante.p2p.net.PeerConnection;
 import com.alterante.p2p.transfer.FileReceiver;
+import com.alterante.p2p.transfer.TcpFileReceiver;
 import com.alterante.p2p.transfer.TransferProgress;
 import com.alterante.p2p.transport.ReliableChannel;
 import picocli.CommandLine;
@@ -34,6 +35,9 @@ public class ReceiveCommand implements Callable<Integer> {
     @CommandLine.Option(names = {"--json"}, description = "Output newline-delimited JSON events instead of human-readable text")
     private boolean json;
 
+    @CommandLine.Mixin
+    private TransferOptions tuning = new TransferOptions();
+
     @Override
     public Integer call() throws Exception {
         try {
@@ -50,6 +54,7 @@ public class ReceiveCommand implements Callable<Integer> {
     private Integer doReceive() throws Exception {
         InetSocketAddress serverAddr = parseAddress(server);
         PeerConnection conn = new PeerConnection(serverAddr, session, psk);
+        conn.applyOptions(tuning);
 
         if (json) {
             conn.setStateListener(JsonOutput::status);
@@ -67,74 +72,129 @@ public class ReceiveCommand implements Callable<Integer> {
             System.out.println("  Remote endpoint: " + conn.remoteEndpoint());
         }
 
-        // Create reliable channel
-        int dtlsSendLimit = conn.dtls().transport().getSendLimit();
-        ReliableChannel channel = new ReliableChannel(conn.router(), 0xB, dtlsSendLimit);
+        if (conn.isTcpRelay()) {
+            // TCP relay path — receive file over TLS, no ReliableChannel
+            try {
+                TcpFileReceiver receiver = new TcpFileReceiver(outputDir,
+                        conn.tcpRelayInputStream(), conn.tcpRelayOutputStream());
 
-        try {
-            FileReceiver receiver = new FileReceiver(outputDir, channel);
+                if (!json) System.out.println("Waiting for file offer...");
 
-            if (!json) System.out.println("Waiting for file offer...");
-
-            // Start receive (blocks until FILE_OFFER arrives, then starts data transfer)
-            // We run progress display in a separate thread once we know the file info
-            Thread progressThread = new Thread(() -> {
-                // Wait until metadata is available (offer received)
-                while (receiver.metadata() == null) {
-                    try { Thread.sleep(100); } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
-                        return;
+                Thread progressThread = new Thread(() -> {
+                    while (receiver.metadata() == null) {
+                        try { Thread.sleep(100); } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            return;
+                        }
                     }
-                }
-                if (json) {
-                    JsonOutput.fileInfo(receiver.metadata());
-                } else {
-                    System.out.println("Receiving: " + receiver.metadata().filename()
-                            + " (" + formatSize(receiver.metadata().fileSize()) + ")");
-                    System.out.println("SHA-256: " + receiver.metadata().sha256Hex());
-                }
-
-                // Wait until progress is available (file accepted)
-                while (receiver.progress() == null) {
-                    try { Thread.sleep(100); } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
-                        return;
+                    if (json) {
+                        JsonOutput.fileInfo(receiver.metadata());
+                    } else {
+                        System.out.println("Receiving: " + receiver.metadata().filename()
+                                + " (" + formatSize(receiver.metadata().fileSize()) + ")");
+                        System.out.println("SHA-256: " + receiver.metadata().sha256Hex());
                     }
-                }
+
+                    while (receiver.progress() == null) {
+                        try { Thread.sleep(100); } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            return;
+                        }
+                    }
+                    if (json) {
+                        printJsonProgress(receiver.progress());
+                    } else {
+                        printProgress(receiver.progress());
+                    }
+                }, "progress");
+                progressThread.setDaemon(true);
+                progressThread.start();
+
+                receiver.receive();
+
+                long durationMs = receiver.progress() != null
+                        ? System.currentTimeMillis() - receiver.progress().startTimeMs()
+                        : 0;
                 if (json) {
-                    printJsonProgress(receiver.progress());
+                    JsonOutput.complete(
+                            receiver.metadata().fileSize(), 0, 0, durationMs,
+                            receiver.outputFile().toString());
                 } else {
-                    printProgress(receiver.progress());
+                    System.out.print("\r" + (receiver.progress() != null ? receiver.progress().progressBar(30) : ""));
+                    System.out.println();
+                    System.out.println("Transfer complete! (TCP relay) File saved to: " + receiver.outputFile());
+                    System.out.printf("  %s received%n", formatSize(receiver.metadata().fileSize()));
                 }
-            }, "progress");
-            progressThread.setDaemon(true);
-            progressThread.start();
-
-            receiver.receive();
-
-            // Final output
-            long durationMs = receiver.progress() != null
-                    ? System.currentTimeMillis() - receiver.progress().startTimeMs()
-                    : 0;
-            if (json) {
-                JsonOutput.complete(
-                        receiver.metadata().fileSize(),
-                        channel.totalPacketsReceived(),
-                        0,
-                        durationMs,
-                        receiver.outputFile().toString());
-            } else {
-                System.out.print("\r" + (receiver.progress() != null ? receiver.progress().progressBar(30) : ""));
-                System.out.println();
-                System.out.println("Transfer complete! File saved to: " + receiver.outputFile());
-                System.out.printf("  %s received, %d packets%n",
-                        formatSize(receiver.metadata().fileSize()),
-                        channel.totalPacketsReceived());
+            } finally {
+                conn.close();
             }
+        } else {
+            // UDP path — ReliableChannel + FileReceiver
+            int dtlsSendLimit = conn.dtls().transport().getSendLimit();
+            ReliableChannel channel = new ReliableChannel(conn.router(), 0xB, dtlsSendLimit, conn.initialCwnd());
+            if (conn.allowRelay()) channel.setRelayMode(true);
+            conn.startRouter();
 
-        } finally {
-            channel.close();
-            conn.close();
+            try {
+                FileReceiver receiver = new FileReceiver(outputDir, channel);
+
+                if (!json) System.out.println("Waiting for file offer...");
+
+                Thread progressThread = new Thread(() -> {
+                    while (receiver.metadata() == null) {
+                        try { Thread.sleep(100); } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            return;
+                        }
+                    }
+                    if (json) {
+                        JsonOutput.fileInfo(receiver.metadata());
+                    } else {
+                        System.out.println("Receiving: " + receiver.metadata().filename()
+                                + " (" + formatSize(receiver.metadata().fileSize()) + ")");
+                        System.out.println("SHA-256: " + receiver.metadata().sha256Hex());
+                    }
+
+                    while (receiver.progress() == null) {
+                        try { Thread.sleep(100); } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            return;
+                        }
+                    }
+                    if (json) {
+                        printJsonProgress(receiver.progress());
+                    } else {
+                        printProgress(receiver.progress());
+                    }
+                }, "progress");
+                progressThread.setDaemon(true);
+                progressThread.start();
+
+                receiver.receive();
+
+                long durationMs = receiver.progress() != null
+                        ? System.currentTimeMillis() - receiver.progress().startTimeMs()
+                        : 0;
+                if (json) {
+                    JsonOutput.complete(
+                            receiver.metadata().fileSize(),
+                            channel.totalPacketsReceived(),
+                            0,
+                            durationMs,
+                            receiver.outputFile().toString());
+                } else {
+                    System.out.print("\r" + (receiver.progress() != null ? receiver.progress().progressBar(30) : ""));
+                    System.out.println();
+                    System.out.println("Transfer complete! File saved to: " + receiver.outputFile());
+                    System.out.printf("  %s received, %d packets%n",
+                            formatSize(receiver.metadata().fileSize()),
+                            channel.totalPacketsReceived());
+                }
+
+            } finally {
+                channel.close();
+                conn.close();
+            }
         }
 
         return 0;

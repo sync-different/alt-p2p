@@ -41,7 +41,7 @@ public class ReliableChannel {
 
     // Transport components
     private final RttEstimator rttEstimator = new RttEstimator();
-    private final CongestionControl congestion = new CongestionControl();
+    private final CongestionControl congestion;
     private final SlidingWindow sendWindow;
     private volatile ReceiveBuffer recvBuffer;
 
@@ -62,6 +62,7 @@ public class ReliableChannel {
 
     // State
     private volatile boolean closed;
+    private boolean relayMode;
     private boolean recvBufferInitialized;
     private long totalPacketsSent;
     private long totalPacketsReceived;
@@ -78,9 +79,14 @@ public class ReliableChannel {
      * @param dtlsSendLimit  max bytes the DTLS transport can send per datagram (from DTLSTransport.getSendLimit())
      */
     public ReliableChannel(PacketRouter router, int connectionId, int dtlsSendLimit) {
+        this(router, connectionId, dtlsSendLimit, null);
+    }
+
+    public ReliableChannel(PacketRouter router, int connectionId, int dtlsSendLimit, Integer initialCwnd) {
         this.router = router;
         this.connectionId = connectionId;
         this.maxChunkData = dtlsSendLimit - Packet.HEADER_SIZE - DATA_HEADER_SIZE;
+        this.congestion = initialCwnd != null ? new CongestionControl(initialCwnd) : new CongestionControl();
 
         int initialSeq = new SecureRandom().nextInt();
         this.sendWindow = new SlidingWindow(initialSeq);
@@ -107,6 +113,15 @@ public class ReliableChannel {
     /** Convenience constructor using the default conservative chunk size. */
     public ReliableChannel(PacketRouter router, int connectionId) {
         this(router, connectionId, MAX_CHUNK_DATA + Packet.HEADER_SIZE + DATA_HEADER_SIZE);
+    }
+
+    /** Enable relay mode: uses a fixed large congestion window, no aggressive backoff. */
+    public void setRelayMode(boolean relay) {
+        this.relayMode = relay;
+        congestion.setRelayMode(relay);
+        if (relay) {
+            log.info("Relay mode enabled: using fixed congestion window");
+        }
     }
 
     /** Set callback for received data. */
@@ -306,7 +321,7 @@ public class ReliableChannel {
                 try {
                     router.send(pkt.data, 0, pkt.data.length);
                     sendWindow.markRetransmitted(pkt.sequence, now);
-                    rttEstimator.backoff();
+                    if (!relayMode) rttEstimator.backoff();
                     congestion.onLoss();
                     totalRetransmissions++;
                     log.debug("RTO retransmit seq={}", pkt.sequence);

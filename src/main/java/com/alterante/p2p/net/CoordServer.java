@@ -90,6 +90,7 @@ public class CoordServer {
             case COORD_REGISTER -> handleRegister(packet, sender);
             case COORD_AUTH -> handleAuth(packet, sender);
             case COORD_KEEPALIVE -> handleKeepalive(packet, sender);
+            case COORD_RELAY -> handleRelay(packet, sender);
             case COORD_PING -> handlePing(sender);
             default -> log.debug("Unexpected type {} from {}", packet.type(), sender);
         }
@@ -209,6 +210,37 @@ public class CoordServer {
                 break;
             }
         }
+    }
+
+    /**
+     * Relay a packet from one peer to the other in the same session.
+     * The COORD_RELAY payload is the raw bytes to forward (opaque to the server).
+     * The server wraps the payload in a new COORD_RELAY packet for the recipient.
+     */
+    private void handleRelay(Packet packet, InetSocketAddress sender) {
+        byte[] payload = packet.payload();
+        if (payload.length == 0) {
+            log.debug("Empty relay packet from {}", sender);
+            return;
+        }
+
+        // Find the session this peer belongs to
+        for (Session session : sessions.values()) {
+            Session.PeerSlot slot = session.findPeer(sender);
+            if (slot != null && slot.authenticated) {
+                Session.PeerSlot other = session.getOtherPeer(sender);
+                if (other != null && other.authenticated) {
+                    // Forward: wrap the same payload in a COORD_RELAY to the other peer
+                    log.info("Relay: {} -> {} ({} bytes)", sender, other.endpoint, payload.length);
+                    sendPacket(other.endpoint, new Packet(PacketType.COORD_RELAY, payload));
+                    session.touch();
+                } else {
+                    log.warn("Relay from {} but no authenticated peer to forward to", sender);
+                }
+                return;
+            }
+        }
+        log.warn("Relay from unknown peer {}", sender);
     }
 
     private void handlePing(InetSocketAddress sender) {

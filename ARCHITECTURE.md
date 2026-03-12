@@ -111,7 +111,7 @@ Minimal server that helps peers find each other:
 ### 2. Sender Application (Java CLI)
 
 ```
-$ java -jar alt-p2p-0.2.0-SNAPSHOT.jar send -s <session-id> --psk <key> --server <host:port> -f <file>
+$ java -jar alt-p2p-0.3.0-SNAPSHOT.jar send -s <session-id> --psk <key> --server <host:port> -f <file>
 
 Options:
   --session, -s    Session ID to join or create (required)
@@ -123,7 +123,7 @@ Options:
 ### 3. Receiver Application (Java CLI)
 
 ```
-$ java -jar alt-p2p-0.2.0-SNAPSHOT.jar receive -s <session-id> --psk <key> --server <host:port> -o <dir>
+$ java -jar alt-p2p-0.3.0-SNAPSHOT.jar receive -s <session-id> --psk <key> --server <host:port> -o <dir>
 
 Options:
   --session, -s    Session ID to join (required)
@@ -548,7 +548,7 @@ Hole punching success depends on the **combination** of both peers' NAT types:
 
 *"Usually" means our implementation detects the port change (accepts PUNCH from expected IP but any port) and updates the endpoint dynamically. This makes symmetric-to-non-symmetric pairs work reliably. Only symmetric-to-symmetric remains unsolvable.
 
-**Fallback strategy**: If hole punching fails after 10 seconds, the connection attempt fails. Relay mode through the coordination server is planned but not yet implemented.
+**Fallback strategy**: If hole punching fails after the configured timeout (default 10 seconds) and `--allow-relay` is set, the system falls back to TCP relay through the coordination server. See the TCP Relay section below.
 
 ### IPv6 Consideration
 
@@ -658,28 +658,64 @@ To prevent abuse and session hijacking, registration requires a challenge-respon
 - A third peer attempting to join an occupied session receives `COORD_ERROR`
 - Session IDs must be at least 128 bits (22+ characters in base62) to prevent guessing
 
-## Relay Protocol (Planned — Not Yet Implemented)
+## TCP Relay Protocol
 
-When hole punching fails (symmetric-to-symmetric NAT), the coordination server would relay P2P traffic. This is planned to be transparent to the transfer layer.
+When hole punching fails (symmetric-to-symmetric NAT, or strict firewall), the coordination server can relay traffic over TCP. The server acts as a **dumb byte-copy proxy** — it never sees plaintext because peers establish a TLS-PSK tunnel through the proxy.
 
-### How Relay Works
+### Architecture
 
 ```
-Sender ──── COORD_RELAY(wrapped packet) ────► Coord Server
-                                                   │
-                                                   │ unwrap, forward
-                                                   ▼
-Receiver ◄── COORD_RELAY(wrapped packet) ──── Coord Server
+Peer A              CoordServer (TCP)           Peer B
+  |--- TCP connect -------->|                     |
+  |--- AUTH (plain) ------->|                     |
+  |                         |<--- TCP connect ----|
+  |                         |<--- AUTH (plain) ---|
+  |<-- AUTH_OK -------------|--- AUTH_OK -------->|
+  |  (server starts splicing bytes bidirectionally)|
+  |====== TLS-PSK handshake through proxy ========|
+  |--- FILE_OFFER (encrypted) ======proxy=======>|
+  |<== FILE_ACCEPT (encrypted) =====proxy========|
+  |--- DATA (64KB chunks) ==========proxy=======>|
+  |--- COMPLETE =================proxy==========>|
+  |<== VERIFIED =================proxy===========|
 ```
 
-The `COORD_RELAY` payload contains the original P2P packet (including its header). The coordination server extracts the connection ID to determine the recipient and forwards the packet.
+### Stream Protocol (length-prefixed messages)
 
-### Relay Limitations
+Format: `type(1B) + length(4B big-endian) + payload`
 
-- **Bandwidth**: Relay traffic consumes server bandwidth. Rate-limit to 10 Mbps per session.
-- **Latency**: Adds one hop (typically 20-50ms additional RTT)
-- **Cost**: Server bandwidth is not free. Large transfers via relay should warn the user.
-- **Server sizing**: A relay-capable server needs more resources than coordination-only (see Deployment section)
+| Code | Name | Direction | Payload |
+|------|------|-----------|---------|
+| 0x01 | AUTH | peer→server | 2B session_id_len + session_id + 32B HMAC |
+| 0x02 | AUTH_OK | server→peer | empty |
+| 0x03 | AUTH_FAIL | server→peer | error UTF-8 |
+| 0x10 | FILE_OFFER | sender→receiver | FileMetadata.encode() bytes |
+| 0x11 | FILE_ACCEPT | receiver→sender | 16B transfer_id + 8B resume_offset |
+| 0x12 | FILE_REJECT | receiver→sender | empty |
+| 0x20 | DATA | sender→receiver | raw file bytes (up to 64KB) |
+| 0x30 | COMPLETE | sender→receiver | 32B SHA-256 |
+| 0x31 | VERIFIED | receiver→sender | empty |
+
+AUTH/AUTH_OK/AUTH_FAIL are **pre-TLS** (plaintext). Everything from FILE_OFFER onward is inside the TLS tunnel.
+
+### Implementation
+
+- **TCP port**: defaults to UDP port + 1 (e.g., 9001). Configurable via `--tcp-port` (server) / `--relay-tcp-port` (client).
+- **TLS role assignment**: same as DTLS — `compareEndpoints(myPublicEndpoint, remoteEndpoint)` determines who is TLS client vs server. Both peers already have public endpoints from UDP coordination.
+- **Server**: `TcpRelayServer` runs on a daemon thread alongside the UDP `CoordServer`. Accepts TCP connections, reads AUTH messages to pair peers by session ID, then splices two sockets bidirectionally with 64KB buffers. 30s timeout for unpaired connections.
+- **Client**: `TcpRelayClient` connects TCP, sends AUTH with HMAC-SHA256, waits for AUTH_OK, then performs TLS-PSK handshake through the proxy.
+- **Transfer**: `TcpFileSender`/`TcpFileReceiver` stream files using the length-prefixed protocol. No congestion control needed — TCP handles it.
+
+### Performance
+
+| Mode | Throughput | Notes |
+|------|-----------|-------|
+| Direct UDP | ~9.5 MB/s | Hole punched, DTLS + ReliableChannel |
+| TCP Relay | ~15 MB/s | Through VPS, TLS-PSK, 155ms RTT |
+| UDP Relay (legacy) | ~530 KB/s | DTLS + COORD_RELAY per-packet wrapping |
+| SCP (baseline) | ~5 MB/s | Same VPS, for comparison |
+
+TCP relay is 28x faster than UDP relay because it eliminates per-packet overhead (DTLS encrypt → COORD_RELAY wrap → UDP send → server decode → unwrap → DTLS decrypt → ReliableChannel SACK/windowing).
 
 ## File Transfer Protocol
 
@@ -971,7 +1007,7 @@ Error handling, timeouts, and encryption are **not polish** — they are foundat
 
 ### Phase 4: Hardening + Features
 
-- [ ] Relay fallback through coordination server
+- [x] TCP relay fallback through coordination server (~15 MB/s)
 - [ ] IPv6 support (direct connection without hole punching)
 - [ ] Multi-address hole punching (try all local interfaces)
 - [ ] Multiple file transfer in one session
@@ -987,7 +1023,8 @@ The coordination server is lightweight and easily deployable to any VPS.
 - Any Linux VPS (Ubuntu 22.04+ recommended)
 - 512 MB RAM minimum
 - Java 17+ runtime
-- Open UDP port (default: 9000)
+- Open UDP port (default: 9000) for coordination
+- Open TCP port (default: 9001) for TCP relay
 
 ### VPS Providers (Budget Options)
 
@@ -1029,7 +1066,7 @@ Type=simple
 User=nobody
 Group=nogroup
 WorkingDirectory=/opt/p2p-coord
-ExecStart=/usr/bin/java -jar alt-p2p-0.2.0-SNAPSHOT.jar server --port 9000 --psk ${PSK}
+ExecStart=/usr/bin/java -jar alt-p2p-0.3.0-SNAPSHOT.jar server --port 9000 --psk ${PSK}
 Restart=always
 RestartSec=5
 
@@ -1060,14 +1097,17 @@ echo "Logs:   sudo journalctl -u p2p-coord -f"
 
 ```bash
 # Ubuntu/Debian (ufw)
-sudo ufw allow 9000/udp
+sudo ufw allow 9000/udp    # Coordination
+sudo ufw allow 9001/tcp    # TCP relay
 
 # CentOS/RHEL (firewalld)
 sudo firewall-cmd --permanent --add-port=9000/udp
+sudo firewall-cmd --permanent --add-port=9001/tcp
 sudo firewall-cmd --reload
 
 # Raw iptables
 sudo iptables -A INPUT -p udp --dport 9000 -j ACCEPT
+sudo iptables -A INPUT -p tcp --dport 9001 -j ACCEPT
 ```
 
 ### Docker Deployment
@@ -1075,15 +1115,16 @@ sudo iptables -A INPUT -p udp --dport 9000 -j ACCEPT
 ```dockerfile
 FROM eclipse-temurin:17-jre-alpine
 WORKDIR /app
-COPY target/alt-p2p-0.2.0-SNAPSHOT.jar .
+COPY target/alt-p2p-0.3.0-SNAPSHOT.jar .
 EXPOSE 9000/udp
+EXPOSE 9001/tcp
 ENV PSK=changeme
-CMD ["java", "-jar", "alt-p2p-0.2.0-SNAPSHOT.jar", "server", "--port", "9000", "--psk", "${PSK}"]
+CMD ["java", "-jar", "alt-p2p-0.3.0-SNAPSHOT.jar", "server", "--port", "9000", "--psk", "${PSK}"]
 ```
 
 ```bash
 docker build -t alt-p2p .
-docker run -d --name alt-p2p -p 9000:9000/udp -e PSK=mysecret alt-p2p
+docker run -d --name alt-p2p -p 9000:9000/udp -p 9001:9001/tcp -e PSK=mysecret alt-p2p
 ```
 
 ### Docker Compose
@@ -1095,6 +1136,7 @@ services:
     build: .
     ports:
       - "9000:9000/udp"
+      - "9001:9001/tcp"
     restart: unless-stopped
     deploy:
       resources:
@@ -1138,7 +1180,7 @@ coord.yourdomain.com  AAAA  2001:db8::1
 ```
 
 ```bash
-java -jar alt-p2p-0.2.0-SNAPSHOT.jar send -f file.zip -s mysession --psk secret --server coord.yourdomain.com:9000
+java -jar alt-p2p-0.3.0-SNAPSHOT.jar send -f file.zip -s mysession --psk secret --server coord.yourdomain.com:9000
 ```
 
 ## Running the Application
@@ -1146,13 +1188,13 @@ java -jar alt-p2p-0.2.0-SNAPSHOT.jar send -f file.zip -s mysession --psk secret 
 ### Start Coordination Server
 
 ```bash
-java -jar alt-p2p-0.2.0-SNAPSHOT.jar server --psk mysecret
+java -jar alt-p2p-0.3.0-SNAPSHOT.jar server --psk mysecret
 ```
 
 ### Sender
 
 ```bash
-java -jar alt-p2p-0.2.0-SNAPSHOT.jar send \
+java -jar alt-p2p-0.3.0-SNAPSHOT.jar send \
   -s abc123 --psk mysecret --server coord.example.com:9000 -f myfile.zip
 > Registered with coordination server
 > Waiting for peer...
@@ -1167,7 +1209,7 @@ java -jar alt-p2p-0.2.0-SNAPSHOT.jar send \
 ### Receiver
 
 ```bash
-java -jar alt-p2p-0.2.0-SNAPSHOT.jar receive \
+java -jar alt-p2p-0.3.0-SNAPSHOT.jar receive \
   -s abc123 --psk mysecret --server coord.example.com:9000 -o ./downloads
 > Registered with coordination server
 > Waiting for peer...

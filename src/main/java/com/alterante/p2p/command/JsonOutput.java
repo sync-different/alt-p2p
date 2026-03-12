@@ -18,6 +18,8 @@ final class JsonOutput {
             case WAITING_PEER -> "waiting_peer";
             case PUNCHING -> "punching";
             case HANDSHAKE -> "handshaking";
+            case RELAYING -> "relaying";
+            case RELAY_TCP -> "relay_tcp";
             case CONNECTED -> "connected";
             default -> state.name().toLowerCase();
         };
