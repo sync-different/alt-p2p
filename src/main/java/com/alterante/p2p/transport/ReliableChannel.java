@@ -102,7 +102,8 @@ public class ReliableChannel {
         // before the consumer calls onControlPacket()
         for (PacketType type : new PacketType[]{
                 PacketType.FILE_OFFER, PacketType.FILE_ACCEPT, PacketType.FILE_REJECT,
-                PacketType.COMPLETE, PacketType.VERIFIED, PacketType.CANCEL}) {
+                PacketType.COMPLETE, PacketType.VERIFIED, PacketType.CANCEL,
+                PacketType.MANIFEST, PacketType.DIR_ENTRY, PacketType.SESSION_COMPLETE}) {
             router.addHandler(type, this::dispatchControl);
         }
 
@@ -202,6 +203,9 @@ public class ReliableChannel {
         router.removeHandler(PacketType.COMPLETE);
         router.removeHandler(PacketType.VERIFIED);
         router.removeHandler(PacketType.CANCEL);
+        router.removeHandler(PacketType.MANIFEST);
+        router.removeHandler(PacketType.DIR_ENTRY);
+        router.removeHandler(PacketType.SESSION_COMPLETE);
         router.setTickCallback(null);
 
         // Wake any blocked senders
@@ -396,7 +400,15 @@ public class ReliableChannel {
     public long totalRetransmissions() { return totalRetransmissions; }
     public long totalSacksReceived() { return totalSacksReceived; }
     public long totalTicks() { return totalTicks; }
-    public int inflightCount() { return sendWindow.inflightCount(); }
+    /** Thread-safe: SlidingWindow must be read under the same lock as track()/processSack(). */
+    public int inflightCount() {
+        windowLock.lock();
+        try {
+            return sendWindow.inflightCount();
+        } finally {
+            windowLock.unlock();
+        }
+    }
     public int cwnd() { return congestion.windowSize(); }
     public long rto() { return rttEstimator.rto(); }
 }

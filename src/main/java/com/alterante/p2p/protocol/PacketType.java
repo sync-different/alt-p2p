@@ -18,11 +18,16 @@ public enum PacketType {
     FILE_OFFER     ((byte) 0x10),
     FILE_ACCEPT    ((byte) 0x11),
     FILE_REJECT    ((byte) 0x12),
+    // Multi-file batch envelope (sent inside the DTLS tunnel as application data;
+    // no conflict with the 0x14-0x17 DTLS record content-type filter, which acts on raw datagrams)
+    MANIFEST       ((byte) 0x13), // batch summary: fileCount(4) + dirCount(4) + totalBytes(8)
+    DIR_ENTRY      ((byte) 0x14), // empty-directory marker: relative path (UTF-8)
     DATA           ((byte) 0x20),
     SACK           ((byte) 0x21),
     COMPLETE       ((byte) 0x30),
     VERIFIED       ((byte) 0x31),
     CANCEL         ((byte) 0x32),
+    SESSION_COMPLETE ((byte) 0x33), // batch terminator (no payload)
 
     // Coordination server
     COORD_REGISTER  ((byte) 0xC0),

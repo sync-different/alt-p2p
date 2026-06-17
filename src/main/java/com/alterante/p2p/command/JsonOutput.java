@@ -1,6 +1,7 @@
 package com.alterante.p2p.command;
 
 import com.alterante.p2p.net.PeerState;
+import com.alterante.p2p.transfer.BatchProgress;
 import com.alterante.p2p.transfer.FileMetadata;
 import com.alterante.p2p.transfer.TransferProgress;
 
@@ -40,6 +41,26 @@ final class JsonOutput {
                 p.speed(),
                 p.etaSeconds(),
                 p.percentComplete());
+    }
+
+    /** Emitted once at the start of a folder transfer so consumers know the totals. */
+    static void manifest(int filesTotal, long bytesTotal) {
+        emit("{\"event\":\"manifest\",\"files_total\":%d,\"bytes_total\":%d}", filesTotal, bytesTotal);
+    }
+
+    /** Per-tick folder progress: overall (bytes/total/percent) plus the current file. */
+    static void batchProgress(BatchProgress bp) {
+        TransferProgress cur = bp.current();
+        long fileBytes = cur != null ? cur.transferredBytes() : 0;
+        long fileTotal = cur != null ? cur.totalBytes() : 0;
+        double filePercent = cur != null ? cur.percentComplete() : 0.0;
+        emit("{\"event\":\"progress\",\"scope\":\"batch\",\"file\":\"%s\","
+                        + "\"file_bytes\":%d,\"file_total\":%d,\"file_percent\":%.1f,"
+                        + "\"files_done\":%d,\"files_total\":%d,"
+                        + "\"bytes\":%d,\"total\":%d,\"percent\":%.1f,\"speed_bps\":%.0f,\"eta_seconds\":%d}",
+                escapeJson(bp.currentName()), fileBytes, fileTotal, filePercent,
+                bp.filesDone(), bp.totalFiles(),
+                bp.processedBytes(), bp.totalBytes(), bp.overallPercent(), bp.speed(), bp.etaSeconds());
     }
 
     static void complete(long bytes, long packets, long retransmissions, long durationMs) {

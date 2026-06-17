@@ -31,6 +31,7 @@ public class CoordClient {
     private Runnable onWaitingForPeer;
     private InetSocketAddress myPublicEndpoint;
     private InetSocketAddress remoteEndpoint;
+    private InetSocketAddress remoteLocalEndpoint;
 
     public CoordClient(DatagramSocket socket, InetSocketAddress serverAddr,
                        String sessionId, String psk) {
@@ -74,6 +75,22 @@ public class CoordClient {
 
     public InetSocketAddress myPublicEndpoint() { return myPublicEndpoint; }
     public InetSocketAddress remoteEndpoint() { return remoteEndpoint; }
+    /** Remote peer's LAN endpoint (a hole-punch candidate), or null if not reported. */
+    public InetSocketAddress remoteLocalEndpoint() { return remoteLocalEndpoint; }
+
+    /** Our LAN endpoint: the source IP used to reach the coord server + our local port. */
+    private InetSocketAddress localEndpoint() {
+        try (DatagramSocket probe = new DatagramSocket()) {
+            probe.connect(serverAddr.getAddress(), serverAddr.getPort());
+            InetAddress local = probe.getLocalAddress();
+            if (local != null && !local.isAnyLocalAddress() && !local.isLoopbackAddress()) {
+                return new InetSocketAddress(local, socket.getLocalPort());
+            }
+        } catch (Exception e) {
+            log.debug("Could not determine local endpoint: {}", e.getMessage());
+        }
+        return null;
+    }
 
     private byte[] register() throws CoordException {
         byte[] idBytes = sessionId.getBytes(StandardCharsets.UTF_8);
@@ -109,11 +126,15 @@ public class CoordClient {
         byte[] hmac = CoordServer.computeHmac(psk, nonce, sessionId);
 
         byte[] idBytes = sessionId.getBytes(StandardCharsets.UTF_8);
-        byte[] payload = new byte[2 + idBytes.length + 32];
+        InetSocketAddress local = localEndpoint();
+        byte[] localEnc = (local != null) ? CoordServer.encodeEndpoint(local) : new byte[0];
+
+        byte[] payload = new byte[2 + idBytes.length + 32 + localEnc.length];
         ByteBuffer.wrap(payload).order(ByteOrder.BIG_ENDIAN)
                 .putShort((short) idBytes.length)
                 .put(idBytes)
-                .put(hmac);
+                .put(hmac)
+                .put(localEnc);
 
         Packet authPkt = new Packet(PacketType.COORD_AUTH, payload);
 
@@ -176,8 +197,17 @@ public class CoordClient {
     }
 
     private void handlePeerInfo(Packet packet) {
-        remoteEndpoint = CoordServer.decodeEndpoint(packet.payload(), 0);
-        log.info("Received PEER_INFO: remote endpoint = {}", remoteEndpoint);
+        byte[] p = packet.payload();
+        remoteEndpoint = CoordServer.decodeEndpoint(p, 0);
+        int off = CoordServer.encodedEndpointLength(p, 0);
+        if (p.length > off) {
+            try {
+                remoteLocalEndpoint = CoordServer.decodeEndpoint(p, off);
+            } catch (RuntimeException e) {
+                log.debug("Ignoring malformed remote local endpoint: {}", e.getMessage());
+            }
+        }
+        log.info("Received PEER_INFO: remote public = {}, local = {}", remoteEndpoint, remoteLocalEndpoint);
     }
 
     private void send(Packet packet) throws CoordException {

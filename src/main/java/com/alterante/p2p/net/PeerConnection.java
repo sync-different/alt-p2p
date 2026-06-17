@@ -33,14 +33,18 @@ public class PeerConnection {
     private Integer initialCwnd;
     private Integer keepaliveIntervalMs;
     private boolean allowRelay;
+    private boolean forceRelay;
     private String relayMode = "tcp";
     private Integer relayTcpPort;
 
+    private int localPort; // 0 = ephemeral; set to reuse a port across reconnects
     private volatile PeerState state = PeerState.INIT;
     private Consumer<PeerState> stateListener;
     private DatagramSocket socket;
     private InetSocketAddress myPublicEndpoint;
-    private InetSocketAddress remoteEndpoint;
+    private InetSocketAddress remoteEndpoint;        // transport target (confirmed after punch)
+    private InetSocketAddress remotePublicEndpoint;  // coord-reported public (used for DTLS role)
+    private InetSocketAddress remoteLocalEndpoint;    // peer's LAN endpoint, if reported
     private DtlsHandler dtls;
     private PacketRouter router;
     private TcpRelayClient tcpRelay;
@@ -62,11 +66,26 @@ public class PeerConnection {
         if (opts.allowRelay && !opts.noRelay) this.allowRelay = true;
         if (opts.relayMode != null) this.relayMode = opts.relayMode;
         if (opts.relayTcpPort != null) this.relayTcpPort = opts.relayTcpPort;
+        if (opts.forceRelay) {
+            this.forceRelay = true;
+            this.allowRelay = true;
+            this.relayMode = "tcp";
+        }
     }
 
     /** Set a listener that is called on every state transition. */
     public void setStateListener(Consumer<PeerState> listener) {
         this.stateListener = listener;
+    }
+
+    /** Bind a specific local UDP port on the next connect() (0 = ephemeral). */
+    public void setLocalPort(int port) {
+        this.localPort = port;
+    }
+
+    /** The bound local UDP port (valid after connect()). Reuse it for reconnects. */
+    public int localPort() {
+        return localPort;
     }
 
     private void setState(PeerState newState) {
@@ -80,8 +99,14 @@ public class PeerConnection {
      */
     public void connect() throws Exception {
         try {
-            socket = new DatagramSocket();
-            log.info("Local socket bound to port {}", socket.getLocalPort());
+            // Bind the requested local port (0 = ephemeral). Reusing the same port
+            // across reconnects keeps our public endpoint stable so the coord server
+            // recognizes us as the same peer instead of rejecting a "third" peer.
+            socket = new DatagramSocket(null);
+            socket.setReuseAddress(true);
+            socket.bind(new InetSocketAddress(localPort));
+            localPort = socket.getLocalPort();
+            log.info("Local socket bound to port {}", localPort);
 
             // Coordination
             setState(PeerState.REGISTERING);
@@ -89,19 +114,31 @@ public class PeerConnection {
             coord.setOnWaitingForPeer(() -> setState(PeerState.WAITING_PEER));
             remoteEndpoint = coord.coordinate();
             myPublicEndpoint = coord.myPublicEndpoint();
+            remotePublicEndpoint = remoteEndpoint;            // coord-reported public
+            remoteLocalEndpoint = coord.remoteLocalEndpoint(); // peer's LAN endpoint (may be null)
 
-            log.info("Coordination complete. Remote peer: {}", remoteEndpoint);
+            log.info("Coordination complete. Remote public: {}, local: {}",
+                    remotePublicEndpoint, remoteLocalEndpoint);
 
-            // Hole punch
+            // Hole punch — try the peer's public endpoint AND its LAN endpoint (handles
+            // both peers behind the same NAT, where the public endpoint can't hairpin).
             setState(PeerState.PUNCHING);
             boolean useRelay = false;
             int connId = new java.security.SecureRandom().nextInt();
-            HolePuncher puncher = (punchIntervalMs != null || punchTimeoutMs != null)
-                    ? new HolePuncher(socket, remoteEndpoint, connId,
-                            punchIntervalMs != null ? punchIntervalMs : 100,
-                            punchTimeoutMs != null ? punchTimeoutMs : 10_000)
-                    : new HolePuncher(socket, remoteEndpoint, connId);
-            HolePunchResult result = puncher.punch();
+            HolePunchResult result;
+            if (forceRelay) {
+                log.info("--force-relay: skipping hole punch, going straight to TCP relay");
+                result = HolePunchResult.failed(0);
+            } else {
+                java.util.List<InetSocketAddress> candidates = new java.util.ArrayList<>();
+                candidates.add(remotePublicEndpoint);
+                if (remoteLocalEndpoint != null && !remoteLocalEndpoint.equals(remotePublicEndpoint)) {
+                    candidates.add(remoteLocalEndpoint);
+                }
+                int interval = punchIntervalMs != null ? punchIntervalMs : 100;
+                int timeout = punchTimeoutMs != null ? punchTimeoutMs : 10_000;
+                result = new HolePuncher(socket, candidates, connId, interval, timeout).punch();
+            }
             if (!result.success()) {
                 if (allowRelay) {
                     log.warn("Hole punch failed after {}ms — falling back to {} relay via {}",
@@ -110,7 +147,7 @@ public class PeerConnection {
                     if ("tcp".equalsIgnoreCase(relayMode)) {
                         // TCP relay path — bypasses DTLS/PacketRouter/ReliableChannel entirely
                         setState(PeerState.RELAY_TCP);
-                        boolean isClient = compareEndpoints(myPublicEndpoint, remoteEndpoint) < 0;
+                        boolean isClient = compareEndpoints(myPublicEndpoint, remotePublicEndpoint) < 0;
                         int tcpPort = relayTcpPort != null ? relayTcpPort : serverAddr.getPort() + 1;
                         InetSocketAddress tcpAddr = new InetSocketAddress(serverAddr.getAddress(), tcpPort);
                         log.info("TCP relay: connecting to {} (TLS role: {})",
@@ -129,19 +166,25 @@ public class PeerConnection {
                 }
             } else {
                 remoteEndpoint = result.confirmedAddress();
-                log.info("Hole punch succeeded in {}ms", result.elapsedMs());
+                java.net.InetAddress ra = remoteEndpoint.getAddress();
+                boolean directLan = ra.isSiteLocalAddress() || ra.isLinkLocalAddress() || ra.isLoopbackAddress();
+                log.info(directLan
+                                ? "Connected directly over LAN in {}ms (peer {})"
+                                : "Connected via NAT hole punch in {}ms (peer {})",
+                        result.elapsedMs(), remoteEndpoint);
             }
 
             // DTLS handshake with retry
             if (!useRelay) {
                 setState(PeerState.HANDSHAKE);
             }
-            // Use public endpoints (exchanged via coord server) for deterministic role assignment.
+            // Use the coord-reported PUBLIC endpoints for deterministic role assignment.
             // Both peers see the same pair of public endpoints, so comparing them yields
-            // opposite roles. Using localPort vs remotePort fails when NAT remaps ports.
-            boolean isClient = compareEndpoints(myPublicEndpoint, remoteEndpoint) < 0;
-            log.info("DTLS role: {} (myPublic={}, remotePublic={})",
-                    isClient ? "CLIENT" : "SERVER", myPublicEndpoint, remoteEndpoint);
+            // opposite roles. Comparing the confirmed transport address breaks when the
+            // punch succeeded via LAN candidates (both peers share a public IP).
+            boolean isClient = compareEndpoints(myPublicEndpoint, remotePublicEndpoint) < 0;
+            log.info("DTLS role: {} (myPublic={}, remotePublic={}, transport={})",
+                    isClient ? "CLIENT" : "SERVER", myPublicEndpoint, remotePublicEndpoint, remoteEndpoint);
 
             for (int attempt = 1; attempt <= dtlsMaxRetries; attempt++) {
                 if (!useRelay) {

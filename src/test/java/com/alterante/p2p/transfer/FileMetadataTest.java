@@ -57,6 +57,20 @@ class FileMetadataTest {
     }
 
     @Test
+    void fromFileWithRelativePathPreservesNestedPath(@TempDir Path tempDir) throws Exception {
+        Path file = tempDir.resolve("data.bin");
+        Files.writeString(file, "payload");
+
+        FileMetadata meta = FileMetadata.fromFile(file, "sub/dir/data.bin");
+
+        assertEquals("sub/dir/data.bin", meta.filename());
+        assertEquals(7, meta.fileSize());
+        assertEquals(32, meta.sha256().length);
+        // round-trips through the wire, slashes intact
+        assertEquals("sub/dir/data.bin", FileMetadata.decode(meta.encode()).filename());
+    }
+
+    @Test
     void sha256HexFormat() {
         byte[] sha = new byte[32];
         sha[0] = (byte) 0x01;

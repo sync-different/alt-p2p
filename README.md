@@ -6,14 +6,15 @@ Peers connect through a lightweight coordination server, punch through NATs, est
 
 ## Features
 
-- **NAT traversal** - UDP hole punching with symmetric NAT support
+- **NAT traversal** - UDP hole punching; accepts a validated PUNCH from any source address, so symmetric-NAT, multi-homed, and hairpin peers work
+- **Multi-file transfer** - Send a whole folder; directory structure (incl. empty subfolders) is mirrored on the receiver, with per-file conflict handling and resume
 - **TCP relay fallback** - When hole punching fails, streams data through the server via TLS-PSK (~15 MB/s)
 - **End-to-end encryption** - DTLS 1.2 (direct) or TLS 1.2 (relay) with pre-shared key authentication
 - **Reliable delivery** - SACK-based selective acknowledgment with retransmission (direct mode)
 - **Congestion control** - AIMD with slow start, fast retransmit, and adaptive receiver window
 - **Integrity verification** - SHA-256 hash checked by receiver after transfer
-- **Resume support** - Interrupted transfers resume from last checkpoint via `.p2p-partial` sidecar files
-- **Progress display** - Real-time progress bar with speed and ETA
+- **Resume support** - Interrupted transfers resume from the last checkpoint; re-running a folder transfer skips already-received files and auto-reconnects on a dropped link (best-effort)
+- **Progress display** - Real-time progress bar with speed and ETA (overall + current file for folders)
 
 ## Performance
 
@@ -45,14 +46,14 @@ TCP relay is 28x faster than the legacy UDP relay approach (530 KB/s) and 3x fas
 mvn package
 ```
 
-Produces a fat JAR at `target/alt-p2p-0.3.0-SNAPSHOT.jar`.
+Produces a fat JAR at `target/alt-p2p-0.4.0-SNAPSHOT.jar`.
 
 ## Usage
 
 ### Start the coordination server
 
 ```bash
-java -jar target/alt-p2p-0.3.0-SNAPSHOT.jar server --psk <shared-key>
+java -jar target/alt-p2p-0.4.0-SNAPSHOT.jar server --psk <shared-key>
 ```
 
 Options:
@@ -64,24 +65,57 @@ Options:
 ### Send a file
 
 ```bash
-java -jar target/alt-p2p-0.3.0-SNAPSHOT.jar send \
+java -jar target/alt-p2p-0.4.0-SNAPSHOT.jar send \
   -s <session-id> --psk <shared-key> --server <host:port> -f <file>
 ```
 
 ### Receive a file
 
 ```bash
-java -jar target/alt-p2p-0.3.0-SNAPSHOT.jar receive \
+java -jar target/alt-p2p-0.4.0-SNAPSHOT.jar receive \
   -s <session-id> --psk <shared-key> --server <host:port> -o <output-dir>
 ```
 
 Both peers must use the same session ID and PSK. The sender and receiver can be started in any order.
+
+### Send a folder (multi-file)
+
+Point `-f` at a directory instead of a file. The CLI scans it recursively, prints a
+`N files, X MB` summary, and transfers every file, preserving the directory structure
+(including empty subfolders) under the receiver's `-o` directory. Symbolic links are
+skipped with a warning.
+
+```bash
+# sender
+java -jar target/alt-p2p-0.4.0-SNAPSHOT.jar send \
+  -s <session-id> --psk <shared-key> --server <host:port> -f <folder>
+
+# receiver (same as for a single file — the output dir mirrors the source folder)
+java -jar target/alt-p2p-0.4.0-SNAPSHOT.jar receive \
+  -s <session-id> --psk <shared-key> --server <host:port> -o <output-dir>
+```
+
+Folder transfers add:
+
+- **Resume** — re-running the same commands skips files already received (matched by
+  SHA-256) and resumes a partially-received file. A dropped link auto-reconnects
+  (best-effort) and resumes; once the retry budget is exhausted it aborts and a manual
+  re-run finishes the job.
+- **Conflicts** — `--on-conflict overwrite|skip|keep-both|ask` (receiver). Default is
+  `ask` on a terminal (per-file prompt, with an `a` suffix to apply to all) and `skip`
+  with `--json`. Files already identical to the source are skipped silently regardless.
 
 ### Relay options (for send and receive)
 
 - `--allow-relay` - Allow relay fallback when hole punching fails
 - `--relay-mode tcp|udp` - Relay transport (default: `tcp`, recommended)
 - `--relay-tcp-port` - Override TCP relay port (default: server UDP port + 1)
+- `--force-relay` - Skip hole punching and go straight to TCP relay (implies the two above)
+
+### Reconnect options (folder transfers)
+
+- `--reconnect-attempts <n>` - Max reconnect attempts on a dropped link (default: 5)
+- `--batch-deadline <seconds>` - Overall wall-clock budget incl. reconnects (default: 600)
 
 ## Architecture
 

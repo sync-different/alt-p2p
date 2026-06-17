@@ -186,17 +186,26 @@ public class CoordServer {
 
         slot.authenticated = true;
         session.touch();
-        log.info("AUTH success from {} for session '{}'", sender, sessionId);
+
+        // Optional trailing local (LAN) endpoint — lets same-NAT peers punch over the LAN.
+        if (buf.hasRemaining()) {
+            try {
+                slot.localEndpoint = decodeEndpoint(payload, buf.position());
+            } catch (RuntimeException e) {
+                log.debug("Ignoring malformed local endpoint from {}: {}", sender, e.getMessage());
+            }
+        }
+        log.info("AUTH success from {} for session '{}' (local={})", sender, sessionId, slot.localEndpoint);
 
         // Send OK with the peer's public endpoint
         sendOk(sender, sender);
 
-        // If both peers are now authenticated, send PEER_INFO to both
+        // If both peers are now authenticated, send PEER_INFO to both (public + local)
         if (session.bothAuthenticated()) {
             Session.PeerSlot peer0 = session.getPeer(0);
             Session.PeerSlot peer1 = session.getPeer(1);
-            sendPeerInfo(peer0.endpoint, peer1.endpoint);
-            sendPeerInfo(peer1.endpoint, peer0.endpoint);
+            sendPeerInfo(peer0.endpoint, peer1.endpoint, peer1.localEndpoint);
+            sendPeerInfo(peer1.endpoint, peer0.endpoint, peer0.localEndpoint);
             log.info("Session '{}': both peers connected, sent PEER_INFO", sessionId);
         }
     }
@@ -258,8 +267,15 @@ public class CoordServer {
         sendPacket(dest, new Packet(PacketType.COORD_OK, payload));
     }
 
-    private void sendPeerInfo(InetSocketAddress dest, InetSocketAddress peerEndpoint) {
-        byte[] payload = encodeEndpoint(peerEndpoint);
+    private void sendPeerInfo(InetSocketAddress dest, InetSocketAddress peerPublic, InetSocketAddress peerLocal) {
+        byte[] pub = encodeEndpoint(peerPublic);
+        byte[] payload = pub;
+        if (peerLocal != null) {
+            byte[] loc = encodeEndpoint(peerLocal);
+            payload = new byte[pub.length + loc.length];
+            System.arraycopy(pub, 0, payload, 0, pub.length);
+            System.arraycopy(loc, 0, payload, pub.length, loc.length);
+        }
         sendPacket(dest, new Packet(PacketType.COORD_PEER_INFO, payload));
     }
 
@@ -291,6 +307,11 @@ public class CoordServer {
         buf.put(addrBytes);
         buf.putShort((short) endpoint.getPort());
         return out;
+    }
+
+    /** Bytes consumed by an endpoint encoded at {@code offset}: 1 (addrLen) + addr + 2 (port). */
+    static int encodedEndpointLength(byte[] data, int offset) {
+        return 1 + (data[offset] & 0xFF) + 2;
     }
 
     static InetSocketAddress decodeEndpoint(byte[] data, int offset) {

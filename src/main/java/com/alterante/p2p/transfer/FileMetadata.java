@@ -27,12 +27,25 @@ public record FileMetadata(UUID transferId, long fileSize, byte[] sha256, String
 
     /**
      * Create FileMetadata from a file on disk, computing SHA-256.
+     * The filename is the basename only.
      */
     public static FileMetadata fromFile(Path file) throws IOException {
+        return fromFile(file, file.getFileName().toString());
+    }
+
+    /**
+     * Create FileMetadata from a file on disk, computing SHA-256, using an
+     * explicit relative path as the filename. Used for multi-file (folder)
+     * transfers to preserve directory structure on the receiver.
+     *
+     * @param file    the file to read
+     * @param relPath POSIX-style relative path (forward slashes) carried in the
+     *                {@code filename} field; the receiver resolves it under its output dir
+     */
+    public static FileMetadata fromFile(Path file, String relPath) throws IOException {
         long size = Files.size(file);
         byte[] hash = computeSha256(file);
-        String name = file.getFileName().toString();
-        return new FileMetadata(UUID.randomUUID(), size, hash, name);
+        return new FileMetadata(UUID.randomUUID(), size, hash, relPath);
     }
 
     /**

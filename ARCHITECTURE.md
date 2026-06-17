@@ -111,7 +111,7 @@ Minimal server that helps peers find each other:
 ### 2. Sender Application (Java CLI)
 
 ```
-$ java -jar alt-p2p-0.3.0-SNAPSHOT.jar send -s <session-id> --psk <key> --server <host:port> -f <file>
+$ java -jar alt-p2p-0.4.0-SNAPSHOT.jar send -s <session-id> --psk <key> --server <host:port> -f <file>
 
 Options:
   --session, -s    Session ID to join or create (required)
@@ -123,7 +123,7 @@ Options:
 ### 3. Receiver Application (Java CLI)
 
 ```
-$ java -jar alt-p2p-0.3.0-SNAPSHOT.jar receive -s <session-id> --psk <key> --server <host:port> -o <dir>
+$ java -jar alt-p2p-0.4.0-SNAPSHOT.jar receive -s <session-id> --psk <key> --server <host:port> -o <dir>
 
 Options:
   --session, -s    Session ID to join (required)
@@ -1008,11 +1008,43 @@ Error handling, timeouts, and encryption are **not polish** — they are foundat
 ### Phase 4: Hardening + Features
 
 - [x] TCP relay fallback through coordination server (~15 MB/s)
+- [x] Multi-file (folder) transfer — direct + relay, structure preserved, conflicts, resume (see below)
+- [x] Hole punch accepts a validated PUNCH from any source address (multi-homed / hairpin)
 - [ ] IPv6 support (direct connection without hole punching)
 - [ ] Multi-address hole punching (try all local interfaces)
-- [ ] Multiple file transfer in one session
 - [x] CLI interface with picocli
 - [ ] Integration tests across NAT simulator
+
+### Multi-File (Folder) Transfer
+
+`send -f <folder>` transfers a directory recursively, mirroring its structure (including
+empty subfolders) under the receiver's output dir. The per-file cycle is unchanged; it's
+wrapped in a batch envelope:
+
+```
+MANIFEST(fileCount, dirCount, totalBytes)
+  ├─ DIR_ENTRY(relPath) × dirCount            # empty directories
+  └─ per file: FILE_OFFER(relPath) → FILE_ACCEPT|FILE_REJECT → DATA… → COMPLETE → VERIFIED
+SESSION_COMPLETE
+```
+
+New message codes (both `PacketType` and `TcpRelayProtocol`): `MANIFEST 0x13`,
+`DIR_ENTRY 0x14`, `SESSION_COMPLETE 0x33`. Relative paths travel in the `FILE_OFFER`
+filename field (POSIX `/`) and are validated against path traversal before the receiver
+writes them. Per-file skip/overwrite/keep-both rides on the existing `FILE_ACCEPT`
+(resume offset) / `FILE_REJECT` messages — no new per-file negotiation.
+
+- **Skip/resume**: an existing file identical by size + SHA-256 is skipped silently;
+  a partial `.p2p-partial` sidecar resumes. Re-running a folder transfer thus only moves
+  what's missing.
+- **Conflicts**: `--on-conflict overwrite|skip|keep-both|ask` on the receiver (TTY default
+  `ask` with apply-to-all; `--json` default `skip`).
+- **Reconnect (best-effort, L1)**: a dropped link is retried (`--reconnect-attempts`,
+  `--batch-deadline`), reusing the same local UDP port so the coordination server re-pairs
+  the peers. Robust reconnect across symmetric NAT and the relay path (server-side
+  dead-peer eviction, peer-id re-registration, relay re-pair) is **deferred (L2)**.
+- Works identically over the **TCP relay** (`TcpDirectorySender`/`TcpDirectoryReceiver`),
+  forceable with `--force-relay`.
 
 ## Coordination Server Deployment
 
@@ -1066,7 +1098,7 @@ Type=simple
 User=nobody
 Group=nogroup
 WorkingDirectory=/opt/p2p-coord
-ExecStart=/usr/bin/java -jar alt-p2p-0.3.0-SNAPSHOT.jar server --port 9000 --psk ${PSK}
+ExecStart=/usr/bin/java -jar alt-p2p-0.4.0-SNAPSHOT.jar server --port 9000 --psk ${PSK}
 Restart=always
 RestartSec=5
 
@@ -1115,11 +1147,11 @@ sudo iptables -A INPUT -p tcp --dport 9001 -j ACCEPT
 ```dockerfile
 FROM eclipse-temurin:17-jre-alpine
 WORKDIR /app
-COPY target/alt-p2p-0.3.0-SNAPSHOT.jar .
+COPY target/alt-p2p-0.4.0-SNAPSHOT.jar .
 EXPOSE 9000/udp
 EXPOSE 9001/tcp
 ENV PSK=changeme
-CMD ["java", "-jar", "alt-p2p-0.3.0-SNAPSHOT.jar", "server", "--port", "9000", "--psk", "${PSK}"]
+CMD ["java", "-jar", "alt-p2p-0.4.0-SNAPSHOT.jar", "server", "--port", "9000", "--psk", "${PSK}"]
 ```
 
 ```bash
@@ -1180,7 +1212,7 @@ coord.yourdomain.com  AAAA  2001:db8::1
 ```
 
 ```bash
-java -jar alt-p2p-0.3.0-SNAPSHOT.jar send -f file.zip -s mysession --psk secret --server coord.yourdomain.com:9000
+java -jar alt-p2p-0.4.0-SNAPSHOT.jar send -f file.zip -s mysession --psk secret --server coord.yourdomain.com:9000
 ```
 
 ## Running the Application
@@ -1188,13 +1220,13 @@ java -jar alt-p2p-0.3.0-SNAPSHOT.jar send -f file.zip -s mysession --psk secret 
 ### Start Coordination Server
 
 ```bash
-java -jar alt-p2p-0.3.0-SNAPSHOT.jar server --psk mysecret
+java -jar alt-p2p-0.4.0-SNAPSHOT.jar server --psk mysecret
 ```
 
 ### Sender
 
 ```bash
-java -jar alt-p2p-0.3.0-SNAPSHOT.jar send \
+java -jar alt-p2p-0.4.0-SNAPSHOT.jar send \
   -s abc123 --psk mysecret --server coord.example.com:9000 -f myfile.zip
 > Registered with coordination server
 > Waiting for peer...
@@ -1209,7 +1241,7 @@ java -jar alt-p2p-0.3.0-SNAPSHOT.jar send \
 ### Receiver
 
 ```bash
-java -jar alt-p2p-0.3.0-SNAPSHOT.jar receive \
+java -jar alt-p2p-0.4.0-SNAPSHOT.jar receive \
   -s abc123 --psk mysecret --server coord.example.com:9000 -o ./downloads
 > Registered with coordination server
 > Waiting for peer...

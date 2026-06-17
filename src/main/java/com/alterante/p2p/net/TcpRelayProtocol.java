@@ -24,9 +24,13 @@ public class TcpRelayProtocol {
     public static final int MSG_FILE_OFFER  = 0x10;
     public static final int MSG_FILE_ACCEPT = 0x11;
     public static final int MSG_FILE_REJECT = 0x12;
+    // Multi-file batch envelope (mirrors protocol.PacketType codes)
+    public static final int MSG_MANIFEST    = 0x13; // fileCount(4) + dirCount(4) + totalBytes(8)
+    public static final int MSG_DIR_ENTRY   = 0x14; // empty-directory marker: relative path (UTF-8)
     public static final int MSG_DATA        = 0x20;
     public static final int MSG_COMPLETE    = 0x30;
     public static final int MSG_VERIFIED    = 0x31;
+    public static final int MSG_SESSION_COMPLETE = 0x33; // batch terminator (no payload)
 
     /** Header size: 1 byte type + 4 bytes length */
     public static final int HEADER_SIZE = 5;

@@ -92,6 +92,8 @@ public class Session {
      */
     public static class PeerSlot {
         public final InetSocketAddress endpoint;
+        /** Peer's LAN (local) endpoint, reported at auth — used as a hole-punch candidate when both peers share a public IP. Null if not reported. */
+        public InetSocketAddress localEndpoint;
         public byte[] nonce;
         public boolean authenticated;
 

@@ -37,4 +37,16 @@ public class TransferOptions {
 
     @CommandLine.Option(names = "--relay-tcp-port", description = "TCP relay port (default: server UDP port + 1)")
     public Integer relayTcpPort;
+
+    @CommandLine.Option(names = "--force-relay",
+            description = "Skip hole punching and go straight to TCP relay (implies --allow-relay --relay-mode tcp). Useful for testing the relay path on a LAN.")
+    public boolean forceRelay;
+
+    @CommandLine.Option(names = "--reconnect-attempts",
+            description = "Max reconnect attempts if the connection drops mid-transfer (default: 5)")
+    public Integer reconnectAttempts;
+
+    @CommandLine.Option(names = "--batch-deadline",
+            description = "Overall wall-clock budget in seconds for a folder transfer incl. reconnects (default: 600)")
+    public Integer batchDeadlineSec;
 }

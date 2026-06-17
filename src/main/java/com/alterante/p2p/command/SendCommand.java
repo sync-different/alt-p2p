@@ -1,6 +1,8 @@
 package com.alterante.p2p.command;
 
 import com.alterante.p2p.net.PeerConnection;
+import com.alterante.p2p.transfer.BatchProgress;
+import com.alterante.p2p.transfer.DirectorySender;
 import com.alterante.p2p.transfer.FileMetadata;
 import com.alterante.p2p.transfer.FileSender;
 import com.alterante.p2p.transfer.TcpFileSender;
@@ -52,12 +54,15 @@ public class SendCommand implements Callable<Integer> {
     }
 
     private Integer doSend() throws Exception {
-        // Validate file
+        // Validate path
         if (!Files.exists(file)) {
             String msg = "file not found: " + file;
             if (json) { JsonOutput.error(msg); return 1; }
             System.err.println("Error: " + msg);
             return 1;
+        }
+        if (Files.isDirectory(file)) {
+            return doSendDirectory();
         }
         if (!Files.isRegularFile(file)) {
             String msg = "not a regular file: " + file;
@@ -168,6 +173,179 @@ public class SendCommand implements Callable<Integer> {
         }
 
         return 0;
+    }
+
+    private Integer doSendDirectory() throws Exception {
+        DirectorySender.Scan scan = DirectorySender.scan(file);
+        if (scan.files().isEmpty() && scan.emptyDirs().isEmpty()) {
+            String msg = "folder is empty: " + file;
+            if (json) { JsonOutput.error(msg); return 1; }
+            System.err.println("Error: " + msg);
+            return 1;
+        }
+        if (!json) {
+            System.out.printf("Folder: %s — %d files, %d empty dirs, %s%n",
+                    file, scan.files().size(), scan.emptyDirs().size(), formatSize(scan.totalBytes()));
+            for (String link : scan.skippedSymlinks()) {
+                System.out.println("  (skipping symlink: " + link + ")");
+            }
+        }
+
+        if (json) JsonOutput.manifest(scan.files().size(), scan.totalBytes());
+
+        InetSocketAddress serverAddr = parseAddress(server);
+        int maxAttempts = tuning.reconnectAttempts != null ? tuning.reconnectAttempts : 5;
+        long deadline = System.currentTimeMillis()
+                + (tuning.batchDeadlineSec != null ? tuning.batchDeadlineSec : 600) * 1000L;
+        java.util.concurrent.atomic.AtomicReference<PeerConnection> connRef = new java.util.concurrent.atomic.AtomicReference<>();
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            PeerConnection c = connRef.get();
+            if (c != null) c.close();
+        }));
+
+        int localPort = 0;
+        boolean connectedOnce = false;
+        for (int attempt = 1; ; attempt++) {
+            PeerConnection conn = new PeerConnection(serverAddr, session, psk);
+            conn.applyOptions(tuning);
+            conn.setLocalPort(localPort);
+            if (json) conn.setStateListener(JsonOutput::status);
+            connRef.set(conn);
+
+            ReliableChannel channel = null;
+            Thread watcher = null;
+            java.util.concurrent.atomic.AtomicBoolean done = new java.util.concurrent.atomic.AtomicBoolean(false);
+            try {
+                if (!json) System.out.println(attempt == 1
+                        ? "Connecting to session '" + session + "' via " + serverAddr + "..."
+                        : "Reconnecting (attempt " + attempt + "/" + maxAttempts + ")...");
+                conn.connect();
+                connectedOnce = true;
+                localPort = conn.localPort();
+                if (!json) System.out.println("Connected! Encrypted P2P link established.");
+
+                if (conn.isTcpRelay()) {
+                    return doRelayDirectorySend(conn, scan); // stream-based, one-shot
+                }
+
+                int dtlsSendLimit = conn.dtls().transport().getSendLimit();
+                channel = new ReliableChannel(conn.router(), 0xA, dtlsSendLimit, conn.initialCwnd());
+                if (conn.allowRelay()) channel.setRelayMode(true);
+                DirectorySender sender = new DirectorySender(file, channel, scan);
+                conn.startRouter();
+                // Start the death watcher AFTER the router thread exists, else awaitStop()
+                // returns immediately and the watcher false-fires a "connection lost".
+                watcher = BatchRunner.startDeathWatcher(conn, channel, Thread.currentThread(), done);
+
+                Thread progressThread = new Thread(() -> printBatchProgress(sender.batchProgress(), done), "progress");
+                progressThread.setDaemon(true);
+                progressThread.start();
+
+                sender.send();
+                done.set(true);
+
+                if (!json) {
+                    System.out.print("\r" + sender.batchProgress().progressLine(30));
+                    System.out.println();
+                    System.out.printf("Folder transfer complete! %d files sent, %d skipped%n",
+                            sender.filesSent(), sender.filesSkipped());
+                } else {
+                    long durationMs = System.currentTimeMillis() - sender.batchProgress().startTimeMs();
+                    JsonOutput.complete(scan.totalBytes(), channel.totalPacketsSent(),
+                            channel.totalRetransmissions(), durationMs);
+                }
+                return 0;
+
+            } catch (Exception e) {
+                done.set(true);
+                if (conn.localPort() != 0) localPort = conn.localPort(); // reuse port so reconnect re-pairs
+                if (channel != null) channel.close();
+                conn.close();
+                Thread.interrupted(); // clear any interrupt from the death watcher
+
+                // Initial connection failed (e.g. hole punch) — don't burn the reconnect
+                // budget retrying a deterministic NAT failure; fail fast with a relay hint.
+                if (!connectedOnce) {
+                    return initialConnectFailure(e);
+                }
+
+                long now = System.currentTimeMillis();
+                if (attempt >= maxAttempts || now >= deadline) {
+                    String msg = "transfer incomplete after " + attempt + " attempt(s): " + describe(e)
+                            + " — re-run the same command to resume (completed files are skipped)";
+                    if (json) JsonOutput.error(msg); else System.err.println("\nError: " + msg);
+                    return 1;
+                }
+                long backoff = BatchRunner.backoffMs(attempt);
+                if (!json) System.err.printf("%nConnection lost: %s — retrying in %.0fs%n",
+                        describe(e), backoff / 1000.0);
+                Thread.sleep(backoff);
+            } finally {
+                if (watcher != null) watcher.interrupt();
+            }
+        }
+    }
+
+    private Integer initialConnectFailure(Exception e) {
+        String d = describe(e);
+        boolean holePunch = d.toLowerCase().contains("hole punch");
+        String hint = (holePunch && !tuning.allowRelay && !tuning.forceRelay)
+                ? " — peers may be behind the same or a symmetric NAT; retry with --force-relay"
+                        + " (or --allow-relay) to use the TCP relay"
+                : "";
+        String msg = "connection failed: " + d + hint;
+        if (json) JsonOutput.error(msg); else System.err.println("\nError: " + msg);
+        return 1;
+    }
+
+    private static String describe(Throwable e) {
+        String m = e.getMessage();
+        return (m != null && !m.isBlank()) ? m : e.getClass().getSimpleName();
+    }
+
+    /** Folder send over TCP relay (stream-based, one-shot — no reconnect loop). */
+    private Integer doRelayDirectorySend(PeerConnection conn, DirectorySender.Scan scan) throws Exception {
+        try {
+            com.alterante.p2p.transfer.TcpDirectorySender sender =
+                    new com.alterante.p2p.transfer.TcpDirectorySender(
+                            conn.tcpRelayInputStream(), conn.tcpRelayOutputStream(), scan);
+            java.util.concurrent.atomic.AtomicBoolean done = new java.util.concurrent.atomic.AtomicBoolean(false);
+            Thread progressThread = new Thread(() -> printBatchProgress(sender.batchProgress(), done), "progress");
+            progressThread.setDaemon(true);
+            progressThread.start();
+
+            sender.send();
+            done.set(true);
+
+            if (!json) {
+                System.out.print("\r" + sender.batchProgress().progressLine(30));
+                System.out.println();
+                System.out.printf("Folder transfer complete! (TCP relay) %d files sent, %d skipped%n",
+                        sender.filesSent(), sender.filesSkipped());
+            } else {
+                long durationMs = System.currentTimeMillis() - sender.batchProgress().startTimeMs();
+                JsonOutput.complete(scan.totalBytes(), 0, 0, durationMs);
+            }
+            return 0;
+        } finally {
+            conn.close();
+        }
+    }
+
+    private void printBatchProgress(BatchProgress batch, java.util.concurrent.atomic.AtomicBoolean stop) {
+        try {
+            while (!stop.get() && !batch.isComplete()) {
+                if (!json) {
+                    System.out.print("\r" + batch.progressLine(30));
+                    System.out.flush();
+                } else {
+                    JsonOutput.batchProgress(batch);
+                }
+                Thread.sleep(250);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     private void printProgress(TransferProgress progress) {
