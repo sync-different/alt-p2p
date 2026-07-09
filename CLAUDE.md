@@ -11,8 +11,8 @@ Peers connect through a lightweight coordination server, punch through NATs, est
 ## Build & Test
 
 ```bash
-mvn package          # Build fat JAR → target/alt-p2p-0.4.0-SNAPSHOT.jar
-mvn test             # Run all 84 tests (JUnit 5)
+mvn package          # Build fat JAR → target/alt-p2p-0.5.0-SNAPSHOT.jar
+mvn test             # Run all tests (JUnit 5) — 117 run, 0 failures (3 disabled de-risking spikes)
 ```
 
 Requires JDK 17+ and Maven 3.9+.
@@ -21,16 +21,16 @@ Requires JDK 17+ and Maven 3.9+.
 
 ```bash
 # Coordination server (also starts TCP relay on port+1)
-java -jar target/alt-p2p-0.4.0-SNAPSHOT.jar server --psk <key>
+java -jar target/alt-p2p-0.5.0-SNAPSHOT.jar server --psk <key>
 
 # Send a file (direct UDP)
-java -jar target/alt-p2p-0.4.0-SNAPSHOT.jar send -s <session> --psk <key> --server <host:port> -f <file>
+java -jar target/alt-p2p-0.5.0-SNAPSHOT.jar send -s <session> --psk <key> --server <host:port> -f <file>
 
 # Send with TCP relay fallback (if hole punching fails)
-java -jar target/alt-p2p-0.4.0-SNAPSHOT.jar send -s <session> --psk <key> --server <host:port> -f <file> --allow-relay --relay-mode tcp
+java -jar target/alt-p2p-0.5.0-SNAPSHOT.jar send -s <session> --psk <key> --server <host:port> -f <file> --allow-relay --relay-mode tcp
 
 # Receive a file
-java -jar target/alt-p2p-0.4.0-SNAPSHOT.jar receive -s <session> --psk <key> --server <host:port> -o <dir>
+java -jar target/alt-p2p-0.5.0-SNAPSHOT.jar receive -s <session> --psk <key> --server <host:port> -o <dir>
 ```
 
 ## Architecture
@@ -40,6 +40,7 @@ src/main/java/com/alterante/p2p/
 ├── Main.java                  # CLI entry point (picocli)
 ├── command/                   # CLI subcommands: server, send, receive + TransferOptions
 ├── net/                       # Networking: coordination, hole punch, DTLS, packet routing, TCP relay
+│   └── tunnel/                # Generic TCP-over-P2P stream tunnel (carrier → mux → forwarders)
 ├── protocol/                  # Binary packet format: codec, types, metadata
 ├── transport/                 # Reliable transport: congestion control, sliding window, SACK
 └── transfer/                  # File transfer: sender, receiver, progress, resume
@@ -58,6 +59,7 @@ src/main/java/com/alterante/p2p/
 - **TcpRelayClient** — TCP connect + HMAC auth + TLS-PSK handshake through proxy
 - **TcpFileSender/TcpFileReceiver** — Stream a single file over TLS with 64KB chunks, length-prefixed messages
 - **TcpDirectorySender/TcpDirectoryReceiver** — Multi-file (folder) batch over the TLS relay stream (stream counterpart of the Directory*; receiver also unifies single-file)
+- **net/tunnel/** — Generic TCP-over-P2P port-forwarding layer (library, no CLI command yet; built for [alt-p2p-lore](https://github.com/sync-different/alt-p2p-lore)). `Tunnels.carrier()` bridges a connected `PeerConnection` to a `BytePipe` — `DirectBytePipe` over a fresh `ReliableChannel` (direct UDP) or `RelayBytePipe` over the relay's TLS streams. `StreamMux` multiplexes many logical streams over the one pipe (frame: `type(1)|streamId(4)|length(4)|payload`; OPEN/DATA/CLOSE; initiator-assigned ids). `ForwardListener` (local port → new stream per accept) and `ForwardConnector` (inbound stream → TCP connect to a local target) with `Bridge` splicing socket↔stream both ways
 
 ### Packet Format
 
@@ -86,10 +88,42 @@ src/main/java/com/alterante/p2p/
 
 ### Congestion Control Tuning
 
-- INITIAL_CWND=32, INITIAL_SSTHRESH=2048 (CongestionControl.java)
+- INITIAL_CWND=32, INITIAL_SSTHRESH=2048, MIN_SSTHRESH=8 (CongestionControl.java)
 - Receiver window: adaptive 256→512 packets, +32 per 128 clean in-order deliveries, halves on >50% buffer pressure (ReceiveBuffer.java)
 - Tick/ACK timer: 10ms (PacketRouter.java, ReceiveBuffer.java)
 - WAN performance: ~9.5 MB/s, 0 retransmissions on 1GB transfer
+
+### Full-Duplex Loss Recovery (ReliableChannel)
+
+Hardening validated by `FullDuplexSpikeTest` (both peers streaming bulk DATA at once — a
+prerequisite for the stream tunnel, which file transfer alone never exercised). Under
+sustained loss the old fast-retransmit path stalled:
+
+- **SACK-driven retransmit**: the receiver's SACK ranges already name the missing sequences,
+  so `sackRetransmit()` resends them immediately instead of waiting for 3 duplicate ACKs —
+  which are unreachable once cwnd has collapsed to a few packets. A gap seen in many
+  consecutive 10ms SACKs is resent at most once per ~SRTT (guard = `max(srtt, 20)ms`), and a
+  SACK gap does **not** back off RTO (it's a confident loss signal, not a timeout).
+- **NewReno fast recovery**: reduce cwnd at most once per loss *episode* (per RTT), not once
+  per lost packet. `inRecovery`/`recoveryPoint` clear when the cumulative ACK advances past
+  the sequence in flight when the loss occurred.
+- **RTO backoff reset** (`RttEstimator.resetBackoff()`): recompute RTO from the smoothed
+  estimates whenever the cumulative ACK advances, so a loss burst doesn't leave RTO pinned
+  near MAX long after recovery (Karn's algorithm otherwise keeps it backed off when the
+  advancing ACKs are for retransmits).
+- **MIN_SSTHRESH raised 2→8**: at cwnd=2 the pipe is starved and SACK feedback too sparse to
+  detect further losses promptly, which re-created the stall. 8 packets (~10 KB) keeps loss
+  detection dense with a still-small footprint.
+- `SlidingWindow.getInFlight(seq)` — O(1) lookup used by the retransmit path (replaces an
+  O(n) scan).
+
+### Coordination Session Recycling
+
+A REGISTER on a session that is already **full but fully paired** (`Session.bothAuthenticated()`)
+recycles the slots (`Session.reset()`) instead of rejecting with "Session full". Once both peers
+have received PEER_INFO they connect directly and no longer depend on the coordinator, so a fresh
+REGISTER is a *new* rendezvous on the same session id — e.g. a persistent host serving successive
+client operations (the alt-p2p-lore host model). Only recycled after pairing completes.
 
 ### NAT Traversal
 
@@ -137,6 +171,7 @@ Events: `status`, `file_info`, `progress`, `complete`, `error`, `log`. Folder tr
 - **Phase 2** (Reliable Transport): Complete
 - **Phase 3** (File Transfer): Complete (except CANCEL message)
 - **Phase 4** (Hardening): CLI, TCP relay, **multi-file folder transfer** (direct + relay, conflicts, resume, best-effort reconnect) done; IPv6 pending
+- **Stream tunnel** (v0.5.0): generic TCP-over-P2P multiplexing (`net/tunnel/`) + full-duplex loss-recovery hardening + coordination session recycling. Library layer for [alt-p2p-lore](https://github.com/sync-different/alt-p2p-lore); not yet exposed as a CLI subcommand.
 - **Deferred (L2)**: robust in-run reconnect across symmetric NAT / relay (coord dead-peer eviction + peer-id re-register, relay re-pair)
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for full design documentation.

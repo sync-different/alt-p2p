@@ -19,7 +19,11 @@ public class CongestionControl {
 
     private static final double DEFAULT_INITIAL_CWND = 32.0;
     private static final int DEFAULT_INITIAL_SSTHRESH = 2048;
-    private static final int MIN_SSTHRESH = 2;
+    // Floor the window well above 2: at cwnd=2 the pipe is starved and SACK
+    // feedback is too sparse to detect further losses promptly, which under
+    // sustained loss re-creates the stall. 8 packets keeps loss detection dense
+    // while still being a small in-flight footprint (~10 KB).
+    private static final int MIN_SSTHRESH = 8;
     private static final int FAST_RETRANSMIT_THRESHOLD = 3;
 
     private static final int RELAY_CWND = 256;

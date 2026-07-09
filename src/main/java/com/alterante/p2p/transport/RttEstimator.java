@@ -53,6 +53,22 @@ public class RttEstimator {
         rto = Math.min(rto * 2, MAX_RTO);
     }
 
+    /**
+     * Undo accumulated RTO backoff when the connection makes forward progress
+     * (cumulative ACK advanced). Recomputes RTO from the current smoothed
+     * estimates so a burst of losses doesn't leave RTO pinned near MAX_RTO
+     * long after recovery. Without this, Karn's algorithm keeps RTO backed off
+     * whenever the advancing ACKs are for retransmitted packets.
+     */
+    public void resetBackoff() {
+        if (hasFirstSample) {
+            rto = Math.round(srtt + 4 * rttvar);
+            rto = Math.max(MIN_RTO, Math.min(MAX_RTO, rto));
+        } else {
+            rto = INITIAL_RTO;
+        }
+    }
+
     /** Current retransmission timeout in milliseconds. */
     public long rto() {
         return rto;

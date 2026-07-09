@@ -111,7 +111,7 @@ Minimal server that helps peers find each other:
 ### 2. Sender Application (Java CLI)
 
 ```
-$ java -jar alt-p2p-0.4.0-SNAPSHOT.jar send -s <session-id> --psk <key> --server <host:port> -f <file>
+$ java -jar alt-p2p-0.5.0-SNAPSHOT.jar send -s <session-id> --psk <key> --server <host:port> -f <file>
 
 Options:
   --session, -s    Session ID to join or create (required)
@@ -123,7 +123,7 @@ Options:
 ### 3. Receiver Application (Java CLI)
 
 ```
-$ java -jar alt-p2p-0.4.0-SNAPSHOT.jar receive -s <session-id> --psk <key> --server <host:port> -o <dir>
+$ java -jar alt-p2p-0.5.0-SNAPSHOT.jar receive -s <session-id> --psk <key> --server <host:port> -o <dir>
 
 Options:
   --session, -s    Session ID to join (required)
@@ -435,9 +435,19 @@ On each non-retransmitted packet's ACK:
 On retransmission timeout:
   rto = rto * 2  (exponential backoff)
   Do NOT update srtt from retransmitted packets (Karn's algorithm)
+
+On forward progress (cumulative ACK advances):
+  rto = clamp(srtt + 4 * rttvar, 200ms, 10s)   (resetBackoff — undo accumulated backoff)
 ```
 
 **Initial RTO**: 1000ms (before any RTT samples are collected)
+
+**RTO backoff reset**: Karn's algorithm says don't sample RTT from retransmitted packets, but
+under a burst of losses the packets whose ACKs finally advance the window are exactly the
+retransmitted ones — so a naive implementation leaves RTO pinned near the 10s ceiling long
+after the network recovered, throttling throughput. Whenever the cumulative ACK advances (proof
+of real forward progress), `RttEstimator.resetBackoff()` recomputes RTO from the current
+smoothed estimates, discarding the accumulated backoff.
 
 ### Congestion Control (AIMD)
 
@@ -458,13 +468,49 @@ Congestion Avoidance (cwnd >= ssthresh):
   On each ACK: cwnd += 1/cwnd packets
   (linear growth: +1 packet per RTT)
 
-On packet loss (detected by 3 duplicate SACKs or RTO):
-  ssthresh = max(cwnd / 2, 2)
-  cwnd = ssthresh          (multiplicative decrease)
+On packet loss (SACK gap or RTO):
+  ssthresh = max(cwnd / 2, 8)   (MIN_SSTHRESH = 8, see below)
+  cwnd = ssthresh               (multiplicative decrease)
   Retransmit lost packet
 ```
 
+**MIN_SSTHRESH = 8** (raised from 2): at `cwnd = 2` the pipe is starved and SACK feedback is
+too sparse to detect further losses promptly, which under sustained loss re-creates a stall.
+A floor of 8 packets (~10 KB in flight) keeps loss detection dense while still being a small
+footprint.
+
 **Receiver window**: The receiver advertises available buffer space in each SACK via an **adaptive window** (see below). The sender never has more than `min(cwnd, receiver_window)` unacknowledged packets in flight.
+
+### Loss Recovery: SACK-Driven Retransmit + NewReno
+
+The transport recovers from loss off the receiver's SACK ranges rather than the classic
+3-duplicate-ACK trigger, and reduces the window once per loss *episode* rather than once per
+lost packet. This was validated for **sustained full-duplex** bulk transfer (both peers
+streaming at once) under injected packet loss — a workload the stream tunnel needs but that
+one-directional file transfer never exercised.
+
+```
+On each SACK:
+  lost = ranges the receiver reports missing (gaps below its cumulative ACK)
+
+  SACK-driven retransmit:
+    for each seq in lost:
+      if in flight, not ACKed, and last sent > max(srtt, 20ms) ago:
+        resend it; mark retransmitted   (do NOT back off RTO — a SACK gap is a
+                                          confident loss signal, not a timeout)
+
+  NewReno fast recovery (reduce cwnd at most once per RTT):
+    if we retransmitted something and not already inRecovery:
+      cwnd = ssthresh = max(cwnd/2, 8)
+      inRecovery = true;  recoveryPoint = highest seq currently in flight
+    on later forward progress, exit recovery once cumulative ACK passes recoveryPoint
+```
+
+Waiting for 3 duplicate ACKs is unreliable here: once `cwnd` collapses to a few packets there
+may never be 3 more packets in flight to generate the duplicates, so the classic trigger never
+fires and the transfer stalls. The receiver's SACK already names the missing sequences, so we
+retransmit them directly. The per-gap guard (`max(srtt, 20ms)`) prevents a gap appearing in
+many consecutive 10ms SACKs from being resent on every SACK.
 
 ### Adaptive Receiver Window
 
@@ -655,7 +701,12 @@ To prevent abuse and session hijacking, registration requires a challenge-respon
 
 - Each session supports exactly **2 peers** (sender + receiver)
 - Sessions expire after `--session-timeout` seconds of inactivity (default: 300s)
-- A third peer attempting to join an occupied session receives `COORD_ERROR`
+- A third peer attempting to join an occupied session receives `COORD_ERROR` — **unless** the
+  session is already fully paired (`bothAuthenticated()`), in which case the slots are recycled
+  (`Session.reset()`) and the REGISTER is treated as a new rendezvous. Once both peers have
+  received `COORD_PEER_INFO` they connect directly and no longer depend on the coordinator, so a
+  fresh REGISTER on the same session id is a *new* connection — e.g. a persistent host serving
+  successive client operations. Recycling only happens after the prior pairing completed.
 - Session IDs must be at least 128 bits (22+ characters in base62) to prevent guessing
 
 ## TCP Relay Protocol
@@ -716,6 +767,53 @@ AUTH/AUTH_OK/AUTH_FAIL are **pre-TLS** (plaintext). Everything from FILE_OFFER o
 | SCP (baseline) | ~5 MB/s | Same VPS, for comparison |
 
 TCP relay is 28x faster than UDP relay because it eliminates per-packet overhead (DTLS encrypt → COORD_RELAY wrap → UDP send → server decode → unwrap → DTLS decrypt → ReliableChannel SACK/windowing).
+
+## Stream Tunnel (TCP-over-P2P)
+
+A generic layer that carries arbitrary TCP connections over an established P2P link. It is
+transport-agnostic — it runs over either the direct UDP/DTLS path or the TCP relay — and knows
+nothing about what bytes flow through it. It is a **library layer** (`net/tunnel/`), not yet a
+CLI subcommand; it was built to let [alt-p2p-lore](https://github.com/sync-different/alt-p2p-lore)
+tunnel a `lore`/`loreserver` gRPC connection between two NAT'd machines.
+
+```
+ developer's `lore`                                       host's `loreserver`
+        │  grpc://127.0.0.1:<localPort>                        127.0.0.1:<grpcPort>
+        ▼                                                              ▲
+  ForwardListener ──┐                                        ┌── ForwardConnector
+   (accept, open    │      StreamMux over one BytePipe       │   (per stream, dial
+    a stream each)  ▼   ┌───────────────────────────────┐    ▼    the local target)
+                 Bridge │ OPEN / DATA / CLOSE frames     │ Bridge
+                        │  type(1) streamId(4) len(4) …  │
+                        └───────────────────────────────┘
+                        carrier = DirectBytePipe (ReliableChannel, direct UDP)
+                               or RelayBytePipe (TCP relay TLS streams)
+```
+
+### Layers
+
+- **Carrier** (`BytePipe`) — one reliable, ordered, encrypted byte stream over the P2P link.
+  `Tunnels.carrier(conn)` builds it from a connected `PeerConnection`: `RelayBytePipe` if the
+  connection fell back to TCP relay, otherwise `DirectBytePipe` over a fresh `ReliableChannel`.
+  (For the direct path the DATA receiver must be registered *before* the router starts — unlike
+  control packets, DATA is not buffered before `onDataReceived` is set.)
+- **Mux** (`StreamMux`) — multiplexes many logical streams over the single carrier, because a
+  real operation opens several concurrent TCP connections (≥2 even with `--max-connections 1`)
+  while a session provides one pipe. Wire frame: `type(1) | streamId(4 BE) | length(4 BE) |
+  payload`; types `OPEN`, `DATA`, `CLOSE`. Stream ids are initiator-assigned and monotonic; the
+  acceptor handles inbound streams via an `onStream` callback. The carrier is already reliable
+  and ordered, so the mux only frames and demultiplexes. **M1 has no per-stream flow control** —
+  a full carrier send window blocks the single frame writer, head-of-line blocking across
+  streams (accepted; identical to gRPC over one HTTP/2 connection).
+- **Forwarders** — `ForwardListener` (client) binds a local TCP port and opens a fresh mux
+  stream per accepted connection; `ForwardConnector` (host) dials a local target for each inbound
+  stream. `Bridge` splices the TCP socket to the mux stream in both directions until either side
+  closes.
+
+Because both machines push data simultaneously (a gRPC call streams both ways at once), the
+tunnel depends on the reliable transport sustaining **full-duplex** throughput under loss —
+which drove the SACK-driven-retransmit / NewReno / RTO-reset hardening described in the
+transport section, validated by `FullDuplexSpikeTest`.
 
 ## File Transfer Protocol
 
@@ -796,14 +894,16 @@ Phase 1 — Slow Start:
 Phase 2 — Congestion Avoidance (cwnd >= ssthresh):
   cwnd grows by 1 per RTT: 2048 → 2049 → 2050 → ...
 
-On 3 duplicate SACKs (fast retransmit):
-  ssthresh = cwnd/2, cwnd = ssthresh
-  Retransmit missing packet immediately
+On a SACK reporting gaps (SACK-driven retransmit + NewReno recovery):
+  Retransmit the named missing packets immediately
+  ssthresh = max(cwnd/2, 8), cwnd = ssthresh  — but at most once per loss episode
 
 On RTO timeout:
-  ssthresh = cwnd/2, cwnd = ssthresh
+  ssthresh = max(cwnd/2, 8), cwnd = ssthresh
   Retransmit lost packet
 ```
+
+See "Loss Recovery: SACK-Driven Retransmit + NewReno" above for the full rationale.
 
 ## Java Implementation
 
@@ -863,7 +963,16 @@ src/main/java/com/alterante/p2p/
 │   ├── PeerConnection.java       # Connection lifecycle (coord → punch → DTLS → router)
 │   ├── PeerState.java            # Connection state enum (INIT → REGISTERING → PUNCHING → ...)
 │   ├── DtlsHandler.java          # DTLS 1.2 via BouncyCastle PSK (includes UdpDatagramTransport)
-│   └── PacketRouter.java         # Single-threaded I/O loop (10ms tick, send queue, keepalive)
+│   ├── PacketRouter.java         # Single-threaded I/O loop (10ms tick, send queue, keepalive)
+│   └── tunnel/                   # Generic TCP-over-P2P stream tunnel (see below)
+│       ├── Tunnels.java          # Factory: PeerConnection → BytePipe carrier (direct or relay)
+│       ├── BytePipe.java         # Carrier abstraction (in/out streams over the P2P link)
+│       ├── DirectBytePipe.java   # Carrier over a fresh ReliableChannel (direct UDP path)
+│       ├── RelayBytePipe.java    # Carrier over the TCP-relay TLS streams
+│       ├── StreamMux.java        # Multiplexes many logical streams over one BytePipe
+│       ├── ForwardListener.java  # Client side: local TCP port → new mux stream per accept
+│       ├── ForwardConnector.java # Host side: inbound mux stream → TCP connect to local target
+│       └── Bridge.java           # Splices a TCP socket ↔ a mux stream both ways
 ├── transport/
 │   ├── ReliableChannel.java      # Reliable transport layer (combines all transport components)
 │   ├── CongestionControl.java    # AIMD congestion control (cwnd=32, ssthresh=2048)
@@ -1010,6 +1119,9 @@ Error handling, timeouts, and encryption are **not polish** — they are foundat
 - [x] TCP relay fallback through coordination server (~15 MB/s)
 - [x] Multi-file (folder) transfer — direct + relay, structure preserved, conflicts, resume (see below)
 - [x] Hole punch accepts a validated PUNCH from any source address (multi-homed / hairpin)
+- [x] Full-duplex loss recovery — SACK-driven retransmit + NewReno + RTO reset (see transport section)
+- [x] Generic TCP-over-P2P stream tunnel (`net/tunnel/`) — library layer for alt-p2p-lore (see Stream Tunnel section)
+- [x] Coordination session recycling for a persistent host (see Session Rules)
 - [ ] IPv6 support (direct connection without hole punching)
 - [ ] Multi-address hole punching (try all local interfaces)
 - [x] CLI interface with picocli
@@ -1098,7 +1210,7 @@ Type=simple
 User=nobody
 Group=nogroup
 WorkingDirectory=/opt/p2p-coord
-ExecStart=/usr/bin/java -jar alt-p2p-0.4.0-SNAPSHOT.jar server --port 9000 --psk ${PSK}
+ExecStart=/usr/bin/java -jar alt-p2p-0.5.0-SNAPSHOT.jar server --port 9000 --psk ${PSK}
 Restart=always
 RestartSec=5
 
@@ -1147,11 +1259,11 @@ sudo iptables -A INPUT -p tcp --dport 9001 -j ACCEPT
 ```dockerfile
 FROM eclipse-temurin:17-jre-alpine
 WORKDIR /app
-COPY target/alt-p2p-0.4.0-SNAPSHOT.jar .
+COPY target/alt-p2p-0.5.0-SNAPSHOT.jar .
 EXPOSE 9000/udp
 EXPOSE 9001/tcp
 ENV PSK=changeme
-CMD ["java", "-jar", "alt-p2p-0.4.0-SNAPSHOT.jar", "server", "--port", "9000", "--psk", "${PSK}"]
+CMD ["java", "-jar", "alt-p2p-0.5.0-SNAPSHOT.jar", "server", "--port", "9000", "--psk", "${PSK}"]
 ```
 
 ```bash
@@ -1212,7 +1324,7 @@ coord.yourdomain.com  AAAA  2001:db8::1
 ```
 
 ```bash
-java -jar alt-p2p-0.4.0-SNAPSHOT.jar send -f file.zip -s mysession --psk secret --server coord.yourdomain.com:9000
+java -jar alt-p2p-0.5.0-SNAPSHOT.jar send -f file.zip -s mysession --psk secret --server coord.yourdomain.com:9000
 ```
 
 ## Running the Application
@@ -1220,13 +1332,13 @@ java -jar alt-p2p-0.4.0-SNAPSHOT.jar send -f file.zip -s mysession --psk secret 
 ### Start Coordination Server
 
 ```bash
-java -jar alt-p2p-0.4.0-SNAPSHOT.jar server --psk mysecret
+java -jar alt-p2p-0.5.0-SNAPSHOT.jar server --psk mysecret
 ```
 
 ### Sender
 
 ```bash
-java -jar alt-p2p-0.4.0-SNAPSHOT.jar send \
+java -jar alt-p2p-0.5.0-SNAPSHOT.jar send \
   -s abc123 --psk mysecret --server coord.example.com:9000 -f myfile.zip
 > Registered with coordination server
 > Waiting for peer...
@@ -1241,7 +1353,7 @@ java -jar alt-p2p-0.4.0-SNAPSHOT.jar send \
 ### Receiver
 
 ```bash
-java -jar alt-p2p-0.4.0-SNAPSHOT.jar receive \
+java -jar alt-p2p-0.5.0-SNAPSHOT.jar receive \
   -s abc123 --psk mysecret --server coord.example.com:9000 -o ./downloads
 > Registered with coordination server
 > Waiting for peer...

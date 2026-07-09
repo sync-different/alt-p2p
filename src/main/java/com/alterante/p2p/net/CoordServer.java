@@ -129,8 +129,18 @@ public class CoordServer {
 
         // Check if session is full
         if (session.isFull()) {
-            sendError(sender, (short) 0x0001, "Session full");
-            return;
+            if (session.bothAuthenticated()) {
+                // The previous pairing already completed — both peers received
+                // PEER_INFO and are connecting directly, no longer needing the
+                // coordinator. A fresh REGISTER means a new rendezvous on this
+                // session id (e.g. a persistent host serving successive client
+                // operations), so recycle the slots instead of rejecting.
+                log.info("Session '{}' already paired; recycling for a new rendezvous", sessionId);
+                session.reset();
+            } else {
+                sendError(sender, (short) 0x0001, "Session full");
+                return;
+            }
         }
 
         // Add peer and send challenge

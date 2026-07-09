@@ -110,6 +110,11 @@ public class SlidingWindow {
         return result;
     }
 
+    /** Look up an in-flight packet by sequence, or null if not tracked. */
+    public SentPacket getInFlight(int sequence) {
+        return inFlight.get(sequence);
+    }
+
     /**
      * Mark a packet as retransmitted (updates timestamp and retransmit count).
      */

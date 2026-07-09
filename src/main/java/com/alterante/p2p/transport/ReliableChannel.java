@@ -64,6 +64,12 @@ public class ReliableChannel {
     private volatile boolean closed;
     private boolean relayMode;
     private boolean recvBufferInitialized;
+
+    // NewReno-style fast recovery: reduce the congestion window at most once per
+    // loss episode (per RTT), not once per lost packet. inRecovery is cleared when
+    // the cumulative ACK advances past the sequence in flight when the loss occurred.
+    private boolean inRecovery;
+    private int recoveryPoint;
     private long totalPacketsSent;
     private long totalPacketsReceived;
     private long totalRetransmissions;
@@ -256,35 +262,43 @@ public class ReliableChannel {
         byte[] payload = pkt.payload();
         SackInfo sack = SackInfo.decode(payload);
 
+        long now = System.currentTimeMillis();
         windowLock.lock();
         try {
-            log.debug("SACK received: cumAck={} window={} ranges={} inflight={}",
-                    sack.cumulativeAck(), sack.receiverWindow(), sack.ranges().size(), sendWindow.inflightCount());
             int oldBase = sendWindow.baseSeq();
             List<Integer> lost = sendWindow.processSack(sack);
             int newBase = sendWindow.baseSeq();
-            log.debug("SACK processed: oldBase={} newBase={} inflight={} mapSize={} remaining={}",
-                    oldBase, newBase, sendWindow.inflightCount(), sendWindow.mapSize(), sendWindow.debugInflight());
 
             // Update receiver window
             receiverWindow = sack.receiverWindow();
 
-            // RTT sample from cumulative ACK advancement (non-retransmitted packets)
+            // Forward progress: cumulative ACK advanced (real, in-order delivery).
             if (newBase != oldBase) {
-                // Use the newest acknowledged packet for RTT sample
                 int ackedSeq = sack.cumulativeAck();
                 if (!sendWindow.wasRetransmitted(ackedSeq)) {
                     long sendTime = sendWindow.getSendTime(ackedSeq);
                     if (sendTime > 0) {
-                        rttEstimator.addSample(System.currentTimeMillis() - sendTime);
+                        rttEstimator.addSample(now - sendTime);
                     }
                 }
+                rttEstimator.resetBackoff();          // FIX: undo RTO backoff on progress
                 congestion.onAck();
-            } else if (!sack.ranges().isEmpty()) {
-                // Duplicate ACK (cumulative didn't advance but we got SACK ranges)
-                if (congestion.onDuplicateAck()) {
-                    // Fast retransmit triggered
-                    retransmitLost(lost);
+                // Exit fast recovery once we've ACKed past the loss point (NewReno).
+                if (inRecovery && !SlidingWindow.seqBefore(newBase - 1, recoveryPoint)) {
+                    inRecovery = false;
+                }
+            }
+
+            // FIX: SACK-driven retransmit. The receiver's SACK ranges already name the
+            // missing sequences; retransmit them promptly instead of waiting for 3
+            // duplicate ACKs — unreachable once cwnd has collapsed to a few packets.
+            if (!lost.isEmpty()) {
+                boolean sent = sackRetransmit(lost, now);
+                // Reduce the window at most once per loss episode (NewReno recovery).
+                if (sent && !inRecovery) {
+                    congestion.onLoss();
+                    inRecovery = true;
+                    recoveryPoint = sendWindow.nextSeq() - 1;
                 }
             }
 
@@ -345,26 +359,31 @@ public class ReliableChannel {
         }
     }
 
-    private void retransmitLost(List<Integer> lostSeqs) {
-        // Already under windowLock
-        long now = System.currentTimeMillis();
+    /**
+     * SACK-driven retransmit (already under windowLock). Retransmits each gap the
+     * receiver reported missing, guarded so a gap appearing in many consecutive
+     * 10ms SACKs is resent at most once per ~RTT rather than on every SACK. Does
+     * NOT back off RTO — a SACK gap is a confident loss signal, not a timeout.
+     *
+     * @return true if at least one packet was retransmitted
+     */
+    private boolean sackRetransmit(List<Integer> lostSeqs, long now) {
+        long guard = Math.max((long) rttEstimator.srtt(), 20);
+        boolean sent = false;
         for (int seq : lostSeqs) {
-            // Look up the SentPacket to get the encoded data
-            List<SlidingWindow.SentPacket> all = sendWindow.getRetransmittable(0, 0);
-            for (SlidingWindow.SentPacket sp : all) {
-                if (sp.sequence == seq) {
-                    try {
-                        router.send(sp.data, 0, sp.data.length);
-                        sendWindow.markRetransmitted(seq, now);
-                        totalRetransmissions++;
-                        log.debug("Fast retransmit seq={}", seq);
-                    } catch (IOException e) {
-                        log.warn("Failed to retransmit seq={}: {}", seq, e.getMessage());
-                    }
-                    break;
-                }
+            SlidingWindow.SentPacket sp = sendWindow.getInFlight(seq);
+            if (sp == null || sp.acked || (now - sp.lastSentMs) < guard) continue;
+            try {
+                router.send(sp.data, 0, sp.data.length);
+                sendWindow.markRetransmitted(seq, now);
+                totalRetransmissions++;
+                sent = true;
+                log.debug("SACK retransmit seq={}", seq);
+            } catch (IOException e) {
+                log.warn("Failed to SACK-retransmit seq={}: {}", seq, e.getMessage());
             }
         }
+        return sent;
     }
 
     private void sendSack() {

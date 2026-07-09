@@ -8,10 +8,11 @@ Peers connect through a lightweight coordination server, punch through NATs, est
 
 - **NAT traversal** - UDP hole punching; accepts a validated PUNCH from any source address, so symmetric-NAT, multi-homed, and hairpin peers work
 - **Multi-file transfer** - Send a whole folder; directory structure (incl. empty subfolders) is mirrored on the receiver, with per-file conflict handling and resume
+- **Stream tunnel (library)** - Multiplex arbitrary TCP connections (e.g. gRPC) over an established P2P link, full-duplex both directions, over either the direct UDP path or the TCP relay. Powers [alt-p2p-lore](https://github.com/sync-different/alt-p2p-lore)
 - **TCP relay fallback** - When hole punching fails, streams data through the server via TLS-PSK (~15 MB/s)
 - **End-to-end encryption** - DTLS 1.2 (direct) or TLS 1.2 (relay) with pre-shared key authentication
 - **Reliable delivery** - SACK-based selective acknowledgment with retransmission (direct mode)
-- **Congestion control** - AIMD with slow start, fast retransmit, and adaptive receiver window
+- **Congestion control** - AIMD with slow start, SACK-driven retransmit, and NewReno fast recovery; validated for sustained full-duplex bulk transfer under packet loss
 - **Integrity verification** - SHA-256 hash checked by receiver after transfer
 - **Resume support** - Interrupted transfers resume from the last checkpoint; re-running a folder transfer skips already-received files and auto-reconnects on a dropped link (best-effort)
 - **Progress display** - Real-time progress bar with speed and ETA (overall + current file for folders)
@@ -46,14 +47,14 @@ TCP relay is 28x faster than the legacy UDP relay approach (530 KB/s) and 3x fas
 mvn package
 ```
 
-Produces a fat JAR at `target/alt-p2p-0.4.0-SNAPSHOT.jar`.
+Produces a fat JAR at `target/alt-p2p-0.5.0-SNAPSHOT.jar`.
 
 ## Usage
 
 ### Start the coordination server
 
 ```bash
-java -jar target/alt-p2p-0.4.0-SNAPSHOT.jar server --psk <shared-key>
+java -jar target/alt-p2p-0.5.0-SNAPSHOT.jar server --psk <shared-key>
 ```
 
 Options:
@@ -65,14 +66,14 @@ Options:
 ### Send a file
 
 ```bash
-java -jar target/alt-p2p-0.4.0-SNAPSHOT.jar send \
+java -jar target/alt-p2p-0.5.0-SNAPSHOT.jar send \
   -s <session-id> --psk <shared-key> --server <host:port> -f <file>
 ```
 
 ### Receive a file
 
 ```bash
-java -jar target/alt-p2p-0.4.0-SNAPSHOT.jar receive \
+java -jar target/alt-p2p-0.5.0-SNAPSHOT.jar receive \
   -s <session-id> --psk <shared-key> --server <host:port> -o <output-dir>
 ```
 
@@ -87,11 +88,11 @@ skipped with a warning.
 
 ```bash
 # sender
-java -jar target/alt-p2p-0.4.0-SNAPSHOT.jar send \
+java -jar target/alt-p2p-0.5.0-SNAPSHOT.jar send \
   -s <session-id> --psk <shared-key> --server <host:port> -f <folder>
 
 # receiver (same as for a single file — the output dir mirrors the source folder)
-java -jar target/alt-p2p-0.4.0-SNAPSHOT.jar receive \
+java -jar target/alt-p2p-0.5.0-SNAPSHOT.jar receive \
   -s <session-id> --psk <shared-key> --server <host:port> -o <output-dir>
 ```
 
@@ -147,12 +148,13 @@ Sender                    Coord Server                  Receiver
 - **Congestion** (`CongestionControl`, `RttEstimator`) - AIMD with adaptive receiver window (256-512 packets)
 - **Transfer** (`FileSender`, `FileReceiver`) - File chunking, progress tracking, SHA-256 verification
 - **TCP Relay** (`TcpRelayServer`, `TcpRelayClient`, `TcpFileSender`, `TcpFileReceiver`) - Server-side TCP proxy with E2E TLS-PSK encryption
+- **Stream Tunnel** (`net/tunnel/`: `Tunnels`, `BytePipe`, `StreamMux`, `ForwardListener`, `ForwardConnector`) - Multiplexes many TCP connections over one P2P carrier (direct or relay)
 - **I/O** (`PacketRouter`) - Single-threaded event loop, 10ms tick, keepalive management
 
 ## Tests
 
 ```bash
-mvn test    # 84 tests
+mvn test    # 117 tests
 ```
 
 ## License

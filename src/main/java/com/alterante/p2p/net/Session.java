@@ -63,6 +63,18 @@ public class Session {
         return peerCount >= MAX_PEERS;
     }
 
+    /**
+     * Clear all peer slots so the session id can be reused for a new rendezvous.
+     * Safe to call only once the previous pairing has completed (see
+     * {@link #bothAuthenticated()}): by then both peers have received PEER_INFO and
+     * are connecting directly, so they no longer depend on the coordinator.
+     */
+    public void reset() {
+        for (int i = 0; i < peerCount; i++) peers[i] = null;
+        peerCount = 0;
+        touch();
+    }
+
     public boolean bothAuthenticated() {
         return peerCount == MAX_PEERS
                 && peers[0].authenticated

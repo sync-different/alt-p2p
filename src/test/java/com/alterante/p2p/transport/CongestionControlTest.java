@@ -75,19 +75,19 @@ class CongestionControlTest {
     }
 
     @Test
-    void cwndFloorIsTwoOnLoss() {
+    void cwndFloorOnLoss() {
+        // MIN_SSTHRESH raised from 2 to 8: at cwnd=2 the pipe is starved and SACK
+        // feedback is too sparse to detect further losses, which re-creates the
+        // loss-induced stall (see FullDuplexSpikeTest). The floor is now 8.
         CongestionControl cc = new CongestionControl();
-        // Multiple losses to drive cwnd down
-        cc.onLoss(); // ssthresh = max(32/2, 2) = 16, cwnd = 16
+        cc.onLoss(); // ssthresh = max(32/2, 8) = 16, cwnd = 16
         assertEquals(16, cc.windowSize());
-        cc.onLoss(); // ssthresh = max(16/2, 2) = 8, cwnd = 8
+        cc.onLoss(); // ssthresh = max(16/2, 8) = 8, cwnd = 8
         assertEquals(8, cc.windowSize());
-        cc.onLoss(); // ssthresh = max(8/2, 2) = 4, cwnd = 4
-        assertEquals(4, cc.windowSize());
-        cc.onLoss(); // ssthresh = max(4/2, 2) = 2, cwnd = 2
-        assertEquals(2, cc.windowSize());
-        cc.onLoss(); // ssthresh = max(2/2, 2) = 2, cwnd = 2 (floor)
-        assertEquals(2, cc.windowSize());
+        cc.onLoss(); // ssthresh = max(8/2, 8) = 8, cwnd = 8 (floor)
+        assertEquals(8, cc.windowSize());
+        cc.onLoss(); // stays at floor
+        assertEquals(8, cc.windowSize());
     }
 
     @Test
