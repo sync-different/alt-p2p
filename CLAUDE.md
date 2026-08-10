@@ -12,7 +12,7 @@ Peers connect through a lightweight coordination server, punch through NATs, est
 
 ```bash
 mvn package          # Build fat JAR → target/alt-p2p-0.6.0-SNAPSHOT.jar
-mvn test             # Run all tests (JUnit 5) — 117 run, 0 failures, 3 skipped (disabled stress spikes)
+mvn test             # Run all tests (JUnit 5) — 120 run, 0 failures, 3 skipped (disabled stress spikes)
 
 mvn test -Dtest=ReliableChannelTest              # one test class
 mvn test -Dtest=ReliableChannelTest#sackRetransmit  # one test method
@@ -77,7 +77,8 @@ src/main/java/com/alterante/p2p/
 - **ReliableChannel** — Combines RttEstimator, CongestionControl, SlidingWindow, ReceiveBuffer
 - **FileSender/FileReceiver** — Single-file chunking, auto-accept, SHA-256 verification, resume via `.p2p-partial` sidecar files
 - **DirectorySender/DirectoryReceiver** — Multi-file (folder) batch over ReliableChannel. Sender scans + sends MANIFEST/DIR_ENTRY/per-file/SESSION_COMPLETE; receiver is event-driven (control on a worker thread, DATA on the router thread), unifies batch + legacy single-file, owns conflict/skip/resume
-- **TcpRelayServer** — TCP accept loop + dumb byte-copy proxy between paired peers
+- **TcpRelayServer** — TCP accept loop + dumb byte-copy proxy between paired peers. Pairs by session
+  id; a first arrival is *parked* until its partner shows up (see "Relay stale-peer pairing" below)
 - **TcpRelayClient** — TCP connect + HMAC auth + TLS-PSK handshake through proxy
 - **TcpFileSender/TcpFileReceiver** — Stream a single file over TLS with 64KB chunks, length-prefixed messages
 - **TcpDirectorySender/TcpDirectoryReceiver** — Multi-file (folder) batch over the TLS relay stream (stream counterpart of the Directory*; receiver also unifies single-file)
@@ -187,6 +188,51 @@ When hole punching fails (symmetric-to-symmetric NAT), peers can fall back to TC
 - Performance: ~15 MB/s via TCP relay (28x faster than UDP relay's 530 KB/s), compared to ~5 MB/s SCP to the same VPS.
 - Stream protocol: length-prefixed messages `type(1B) + length(4B BE) + payload`. Types: AUTH, AUTH_OK, FILE_OFFER, FILE_ACCEPT, DATA (64KB), COMPLETE, VERIFIED.
 
+### Relay Stale-Peer Pairing (v0.6.1)
+
+`TcpRelayServer` matches two authenticated connections by session id and splices them. Until 0.6.1 its
+only liveness test was `!socket.isClosed()` — **true whenever *we* have not closed the socket locally**,
+so a peer whose process had gone still passed it. A live arrival was then spliced to that corpse.
+
+**Why it is hard to diagnose from the client:** the symptom is a bare `handshake_failure(40)` from
+BouncyCastle, which points at PSK mismatch or TLS role assignment. Both are red herrings — the far side
+simply never sent a hello. The tell is server-side: **a splice that ends with 0 bytes in both
+directions**, immediately.
+
+Observed live 2026-08-10: a peer parked at 19:04:40 was spliced to a fresh arrival 44s later; the client
+saw `handshake_failure(40)`. Retrying "worked" because each attempt consumed one corpse and parked a new
+connection — the queue shuffled forward until two live peers happened to land together, which masks the
+bug as flakiness.
+
+The fix has two independent halves, because they catch different failures:
+
+- **Liveness probe at pairing time** (`isPeerAlive`) — a 5ms read; **EOF means dead**. This is the only
+  probe that works here: after the peer closes we hold a *half-open* socket where `isClosed()` is false
+  (we did not close it), `isInputShutdown()` is false (that is *our* shutdown), and `sendUrgentData`
+  **succeeds** (a half-closed socket may still send). Reading is safe because the protocol makes a
+  parked peer silent — it has sent AUTH and must wait for `AUTH_OK`, which only arrives on pairing — and
+  anything readable is pushed back through a `PushbackInputStream` that is then handed to the splice, so
+  no byte is lost between probing and splicing.
+- **`PAIR_TIMEOUT_MS` 60s → 30s** — the corpse in the incident was 44s old, i.e. *inside* the old
+  window, so the reaper never saw it. Both peers normally reach the relay within seconds of PEER_INFO.
+
+**Log lines to grep when a relay connection misbehaves:**
+
+```bash
+journalctl -u alt-p2p-coord | grep -E "STALE parked peer|0 bytes|reaping unpaired|starting splice"
+```
+
+| line | meaning |
+|---|---|
+| `discarding STALE parked peer …` | the probe fired — a corpse was rejected instead of spliced |
+| `splice … ended with 0 bytes` | **WARN** — the peers never spoke; the live side sees `handshake_failure` |
+| `reaping unpaired peer … after Nms` | timeout swept a peer whose partner never came (was DEBUG, invisible in production) |
+| `starting splice (A <-> B, first peer waited Nms)` | healthy pairing, with both addresses and the wait |
+
+`TcpRelayServerTest` is the relay's **first** test coverage — its absence is how this shipped. It covers
+the happy path (pair + bytes both ways), wrong-PSK rejection, and the regression: park a peer, kill it,
+and assert a live arrival is *not* paired to it.
+
 ### Multi-File (Folder) Transfer
 
 `send -f <folder>` transfers a whole directory; works on both the direct-UDP and TCP-relay paths.
@@ -214,6 +260,11 @@ Events: `status`, `file_info`, `progress`, `complete`, `error`, `log`. Folder tr
 - **Phase 4** (Hardening): CLI, TCP relay, **multi-file folder transfer** (direct + relay, conflicts, resume, best-effort reconnect) done; IPv6 pending
 - **Stream tunnel** (v0.5.0): generic TCP-over-P2P multiplexing (`net/tunnel/`) + full-duplex loss-recovery hardening + coordination session recycling. Library layer for [alt-p2p-lore](https://github.com/sync-different/alt-p2p-lore); not yet exposed as a CLI subcommand.
 - **Host longevity** (v0.6.0): `DatagramSocket` fd-leak fix + coord keepalive + `--peer-wait` / wait-forever host mode — see "Long-Lived Hosts" above. Consumed by alt-p2p-bbs and alt-p2p-lore, which **shade** this JAR: bumping the version here means bumping `<alt-p2p.version>` in both sibling poms and rebuilding their fat JARs.
+- **Relay stale-peer fix** (v0.6.1): `TcpRelayServer` no longer splices a live peer to a departed one —
+  see "Relay stale-peer pairing" above. **Coordinator-only change**: `TcpRelayClient`/`PeerConnection`
+  are untouched and there is no protocol change, so a 0.6.1 relay serves 0.5.0/0.6.0 peers unchanged and
+  only the coordinator needs the new jar. Deployed to demo7 2026-08-10 (0.5.0 → 0.6.1, verified by the
+  reaper firing at 30s).
 - **Deferred (L2)**: robust in-run reconnect across symmetric NAT / relay (coord dead-peer eviction + peer-id re-register, relay re-pair)
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for full design documentation.
