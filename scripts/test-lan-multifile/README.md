@@ -7,13 +7,13 @@ subnet. **Machine A** runs the coordination server and receives; **Machine B** s
 
 On **both** machines you need JDK 17+ and the **same** fat JAR.
 
-- **Machine A** (this repo): the JAR is already at `target/alt-p2p-0.4.0-SNAPSHOT.jar`.
+- **Machine A** (this repo): the JAR is already at `target/alt-p2p-0.6.0-SNAPSHOT.jar`.
 - **Machine B**: copy the JAR over, plus this whole `scripts/test-lan-multifile/` folder:
   ```bash
-  scp target/alt-p2p-0.4.0-SNAPSHOT.jar  <userB>@<B-ip>:~/
+  scp target/alt-p2p-0.6.0-SNAPSHOT.jar  <userB>@<B-ip>:~/
   scp -r scripts/test-lan-multifile      <userB>@<B-ip>:~/
   ```
-  On B, tell the scripts where the JAR is:  `export JAR=~/alt-p2p-0.4.0-SNAPSHOT.jar`
+  On B, tell the scripts where the JAR is:  `export JAR=~/alt-p2p-0.6.0-SNAPSHOT.jar`
   (or just drop the JAR inside the `test-lan-multifile/` folder — it's auto-detected).
 
 `config.sh` holds the shared `SESSION`, `PSK`, and `SERVER_HOST` (machine A's LAN IP,

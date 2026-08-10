@@ -1,10 +1,11 @@
 #./sethost.sh
-#export SERVER_HOST=89.144.2.81
+export SERVER_HOST=192.168.1.243
 export JARPATH="../../target/alt-p2p-0.6.0-SNAPSHOT.jar"
 echo JARPATH=$JARPATH
-export RECV_DIR=~/Downloads/tester0616k
-export SESSION=test123456.14
+export RECV_DIR=~/Downloads/alt-p2p-test-00
+export SESSION=test123456.16
 export PORT=9000
+export PSK=DaleDale
 echo "RECV_DIR=$RECV_DIR"
 echo "SESSION=$SESSION"
 echo "PSK=$PSK"

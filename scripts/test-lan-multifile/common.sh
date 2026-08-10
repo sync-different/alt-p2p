@@ -26,7 +26,7 @@ require_jar() {
     JARPATH="$(find_jar)"
     if [ -z "$JARPATH" ]; then
         echo "ERROR: alt-p2p JAR not found." >&2
-        echo "  Set JAR=/path/to/alt-p2p-0.4.0-SNAPSHOT.jar, or drop the JAR beside these scripts." >&2
+        echo "  Set JAR=/path/to/alt-p2p-0.6.0-SNAPSHOT.jar, or drop the JAR beside these scripts." >&2
         exit 1
     fi
     echo "Using JAR: $JARPATH"

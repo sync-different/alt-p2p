@@ -38,6 +38,7 @@ public class PeerConnection {
     private Integer relayTcpPort;
 
     private int localPort; // 0 = ephemeral; set to reuse a port across reconnects
+    private int peerWaitMs = 120_000; // how long to wait for the peer at the coord; <=0 = forever
     private volatile PeerState state = PeerState.INIT;
     private Consumer<PeerState> stateListener;
     private DatagramSocket socket;
@@ -66,6 +67,7 @@ public class PeerConnection {
         if (opts.allowRelay && !opts.noRelay) this.allowRelay = true;
         if (opts.relayMode != null) this.relayMode = opts.relayMode;
         if (opts.relayTcpPort != null) this.relayTcpPort = opts.relayTcpPort;
+        if (opts.peerWaitSeconds != null) this.peerWaitMs = opts.peerWaitSeconds <= 0 ? 0 : opts.peerWaitSeconds * 1000;
         if (opts.forceRelay) {
             this.forceRelay = true;
             this.allowRelay = true;
@@ -112,6 +114,7 @@ public class PeerConnection {
             setState(PeerState.REGISTERING);
             CoordClient coord = new CoordClient(socket, serverAddr, sessionId, psk);
             coord.setOnWaitingForPeer(() -> setState(PeerState.WAITING_PEER));
+            coord.setPeerWaitMs(peerWaitMs);
             remoteEndpoint = coord.coordinate();
             myPublicEndpoint = coord.myPublicEndpoint();
             remotePublicEndpoint = remoteEndpoint;            // coord-reported public
@@ -223,8 +226,14 @@ public class PeerConnection {
                     : new PacketRouter(dtls);
 
         } catch (Exception e) {
-            setState(PeerState.ERROR);
             log.error("Connection failed: {}", e.getMessage());
+            // Release the socket / dtls / relay bound during this failed attempt.
+            // connect() throws before the caller ever receives a PeerConnection to close(),
+            // so without this every failed connect — e.g. a host/serve that keeps hitting the
+            // 120s "waiting for peer" timeout, or a punch-fail → relay read-timeout — orphans
+            // the DatagramSocket fd and eventually exhausts them (observed: 758 leaked sockets).
+            try { close(); } catch (Exception ignore) { /* don't mask the original failure */ }
+            setState(PeerState.ERROR); // after close() (it resets state to INIT) so ERROR is the final state
             throw e;
         }
     }

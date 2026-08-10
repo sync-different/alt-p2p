@@ -1,7 +1,10 @@
-export JARPATH="../alt-p2p-0.4.0-SNAPSHOT.jar"
-export SRC_DIR=~/Downloads/hivebot-design
-export SESSION=test123456.1
+#export JARPATH="../alt-p2p-0.6.0-SNAPSHOT.jar"
+export JARPATH="../../target/alt-p2p-0.6.0-SNAPSHOT.jar"
+export SRC_DIR=~/Downloads/alt-p2p-test-01
+export SESSION=test123456.18
 export PORT=9000
+export SERVER_HOST=192.168.1.243
+export PSK=DaleDale
 echo "JARPATH=$JARPATH"
 echo "SRCDIR=$SRC_DIR"
 echo "SESSION=$SESSION"

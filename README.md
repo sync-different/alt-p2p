@@ -47,14 +47,14 @@ TCP relay is 28x faster than the legacy UDP relay approach (530 KB/s) and 3x fas
 mvn package
 ```
 
-Produces a fat JAR at `target/alt-p2p-0.5.0-SNAPSHOT.jar`.
+Produces a fat JAR at `target/alt-p2p-0.6.0-SNAPSHOT.jar`.
 
 ## Usage
 
 ### Start the coordination server
 
 ```bash
-java -jar target/alt-p2p-0.5.0-SNAPSHOT.jar server --psk <shared-key>
+java -jar target/alt-p2p-0.6.0-SNAPSHOT.jar server --psk <shared-key>
 ```
 
 Options:
@@ -66,14 +66,14 @@ Options:
 ### Send a file
 
 ```bash
-java -jar target/alt-p2p-0.5.0-SNAPSHOT.jar send \
+java -jar target/alt-p2p-0.6.0-SNAPSHOT.jar send \
   -s <session-id> --psk <shared-key> --server <host:port> -f <file>
 ```
 
 ### Receive a file
 
 ```bash
-java -jar target/alt-p2p-0.5.0-SNAPSHOT.jar receive \
+java -jar target/alt-p2p-0.6.0-SNAPSHOT.jar receive \
   -s <session-id> --psk <shared-key> --server <host:port> -o <output-dir>
 ```
 
@@ -88,11 +88,11 @@ skipped with a warning.
 
 ```bash
 # sender
-java -jar target/alt-p2p-0.5.0-SNAPSHOT.jar send \
+java -jar target/alt-p2p-0.6.0-SNAPSHOT.jar send \
   -s <session-id> --psk <shared-key> --server <host:port> -f <folder>
 
 # receiver (same as for a single file — the output dir mirrors the source folder)
-java -jar target/alt-p2p-0.5.0-SNAPSHOT.jar receive \
+java -jar target/alt-p2p-0.6.0-SNAPSHOT.jar receive \
   -s <session-id> --psk <shared-key> --server <host:port> -o <output-dir>
 ```
 

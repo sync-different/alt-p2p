@@ -22,6 +22,7 @@ public class CoordClient {
     private static final Logger log = LoggerFactory.getLogger(CoordClient.class);
     private static final int RECV_TIMEOUT_MS = 5000;
     private static final int MAX_RETRIES = 3;
+    private static final long KEEPALIVE_INTERVAL_MS = 90_000; // keep the coord session alive while waiting (< its ~300s timeout)
 
     private final DatagramSocket socket;
     private final InetSocketAddress serverAddr;
@@ -29,6 +30,7 @@ public class CoordClient {
     private final String psk;
 
     private Runnable onWaitingForPeer;
+    private int peerWaitMs = 120_000; // how long waitForPeerInfo waits for the peer; <=0 = forever
     private InetSocketAddress myPublicEndpoint;
     private InetSocketAddress remoteEndpoint;
     private InetSocketAddress remoteLocalEndpoint;
@@ -40,6 +42,9 @@ public class CoordClient {
         this.sessionId = sessionId;
         this.psk = psk;
     }
+
+    /** How long waitForPeerInfo() waits for the peer to join; &lt;= 0 means wait forever. */
+    public void setPeerWaitMs(int ms) { this.peerWaitMs = ms; }
 
     /**
      * Run the full coordination flow. Blocks until PEER_INFO is received or fails.
@@ -171,12 +176,19 @@ public class CoordClient {
             return;
         }
 
-        log.info("Waiting for peer to join session '{}'...", sessionId);
+        boolean forever = peerWaitMs <= 0;
+        log.info("Waiting for peer to join session '{}' ({})", sessionId,
+                forever ? "no timeout" : "up to " + (peerWaitMs / 1000) + "s");
         if (onWaitingForPeer != null) onWaitingForPeer.run();
 
-        // Longer timeout for waiting: the other peer might not have connected yet.
-        // We'll poll with the existing timeout, up to 120 seconds total.
-        long deadline = System.currentTimeMillis() + 120_000;
+        // A host/serve may sit here a long time (peerWaitMs <= 0 = forever). Send a
+        // COORD_KEEPALIVE every KEEPALIVE_INTERVAL_MS so the coordinator does not expire
+        // our session (its lastActivity timeout). This holds ONE socket/registration open
+        // instead of tearing down and re-registering, which used to leak a DatagramSocket
+        // fd per cycle on a waiting host.
+        long start = System.currentTimeMillis();
+        long deadline = forever ? Long.MAX_VALUE : start + peerWaitMs;
+        long lastKeepalive = start;
 
         while (System.currentTimeMillis() < deadline) {
             try {
@@ -190,10 +202,24 @@ public class CoordClient {
                     log.debug("Ignoring {} while waiting for PEER_INFO", response.type());
                 }
             } catch (SocketTimeoutException e) {
-                // Expected: just keep waiting
+                // Expected (5s recv timeout): fall through to the keepalive check.
+            }
+            long now = System.currentTimeMillis();
+            if (now - lastKeepalive >= KEEPALIVE_INTERVAL_MS) {
+                try {
+                    sendKeepalive();
+                    log.debug("Sent COORD_KEEPALIVE for session '{}'", sessionId);
+                } catch (CoordException e) {
+                    log.warn("Coord keepalive send failed: {}", e.getMessage());
+                }
+                lastKeepalive = now;
             }
         }
-        throw new CoordException("Timed out waiting for peer (120s)");
+        throw new CoordException("Timed out waiting for peer (" + (peerWaitMs / 1000) + "s)");
+    }
+
+    private void sendKeepalive() throws CoordException {
+        send(new Packet(PacketType.COORD_KEEPALIVE, new byte[0]));
     }
 
     private void handlePeerInfo(Packet packet) {

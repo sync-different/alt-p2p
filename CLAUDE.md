@@ -11,26 +11,48 @@ Peers connect through a lightweight coordination server, punch through NATs, est
 ## Build & Test
 
 ```bash
-mvn package          # Build fat JAR → target/alt-p2p-0.5.0-SNAPSHOT.jar
-mvn test             # Run all tests (JUnit 5) — 117 run, 0 failures (3 disabled de-risking spikes)
+mvn package          # Build fat JAR → target/alt-p2p-0.6.0-SNAPSHOT.jar
+mvn test             # Run all tests (JUnit 5) — 117 run, 0 failures, 3 skipped (disabled stress spikes)
+
+mvn test -Dtest=ReliableChannelTest              # one test class
+mvn test -Dtest=ReliableChannelTest#sackRetransmit  # one test method
+mvn test -Dtest='Tcp*Test'                       # pattern
 ```
 
 Requires JDK 17+ and Maven 3.9+.
+
+The two `@Disabled` cases in `FullDuplexSpikeTest` are **isolation-only** stress tests (pass
+1500/1500 run alone, flaky under parallel loopback load) — re-enable them individually when
+touching loss recovery, don't treat them as dead.
+
+### End-to-end harnesses (not JUnit)
+
+Real transfers need two processes and a coordinator, so the integration story lives in shell:
+
+```bash
+./scripts/loopback.sh            # single-machine dev loop: coord + receiver + sender + verify + teardown
+./scripts/gen-corpus.sh <dir>    # build a multi-file test tree (nested, 0-byte, empty dirs, symlink)
+./scripts/verify-tree.sh <src> <dst>  # assert received tree mirrors source by path + SHA-256
+scripts/test-lan-multifile/      # multi-box LAN/WAN harness (config.sh + coord/send/recv/verify)
+```
+
+`loopback.sh` is the first-level check for any transfer change; `verify-tree.sh` is what makes a
+multi-file run pass/fail (symlinks are excluded at the source and must be **absent** downstream).
 
 ## Running
 
 ```bash
 # Coordination server (also starts TCP relay on port+1)
-java -jar target/alt-p2p-0.5.0-SNAPSHOT.jar server --psk <key>
+java -jar target/alt-p2p-0.6.0-SNAPSHOT.jar server --psk <key>
 
 # Send a file (direct UDP)
-java -jar target/alt-p2p-0.5.0-SNAPSHOT.jar send -s <session> --psk <key> --server <host:port> -f <file>
+java -jar target/alt-p2p-0.6.0-SNAPSHOT.jar send -s <session> --psk <key> --server <host:port> -f <file>
 
 # Send with TCP relay fallback (if hole punching fails)
-java -jar target/alt-p2p-0.5.0-SNAPSHOT.jar send -s <session> --psk <key> --server <host:port> -f <file> --allow-relay --relay-mode tcp
+java -jar target/alt-p2p-0.6.0-SNAPSHOT.jar send -s <session> --psk <key> --server <host:port> -f <file> --allow-relay --relay-mode tcp
 
 # Receive a file
-java -jar target/alt-p2p-0.5.0-SNAPSHOT.jar receive -s <session> --psk <key> --server <host:port> -o <dir>
+java -jar target/alt-p2p-0.6.0-SNAPSHOT.jar receive -s <session> --psk <key> --server <host:port> -o <dir>
 ```
 
 ## Architecture
@@ -125,6 +147,25 @@ have received PEER_INFO they connect directly and no longer depend on the coordi
 REGISTER is a *new* rendezvous on the same session id — e.g. a persistent host serving successive
 client operations (the alt-p2p-lore host model). Only recycled after pairing completes.
 
+### Long-Lived Hosts: Socket Lifetime & Peer Wait
+
+A persistent host (bbs `host`, lore `serve`) sits in `waitForPeerInfo()` for hours. Two invariants
+make that survivable — both are easy to regress:
+
+- **`connect()` must `close()` its own socket on failure.** `PeerConnection.connect()` throws before
+  the caller ever holds a `PeerConnection` to close, so a failed attempt (peer-wait timeout, punch
+  fail → relay read-timeout) orphans the `DatagramSocket` fd. A waiting host leaked **758 sockets**
+  this way. The ordering in the `catch` is load-bearing: `close()` **then** `setState(ERROR)` —
+  `close()` resets state to `INIT`, so setting ERROR first is silently undone (a test covers this).
+- **`CoordClient` sends `COORD_KEEPALIVE` every 90s while waiting**, under the coordinator's ~300s
+  `lastActivity` expiry. This holds *one* registration open instead of tearing down and
+  re-registering per cycle — which is what produced the fd leak. The coordinator already handled
+  this packet type; no server change was needed.
+
+`--peer-wait <sec>` sets the wait (`CoordClient.setPeerWaitMs`); **`<= 0` means wait forever**.
+One-shot `send`/`receive` keep the 120s default; the bbs `host` and lore `serve` commands default to
+forever. Wait-forever plus the two invariants above is what makes an idle host cost exactly one socket.
+
 ### NAT Traversal
 
 - Receiving a PUNCH = success (don't wait for PUNCH_ACK)
@@ -172,6 +213,7 @@ Events: `status`, `file_info`, `progress`, `complete`, `error`, `log`. Folder tr
 - **Phase 3** (File Transfer): Complete (except CANCEL message)
 - **Phase 4** (Hardening): CLI, TCP relay, **multi-file folder transfer** (direct + relay, conflicts, resume, best-effort reconnect) done; IPv6 pending
 - **Stream tunnel** (v0.5.0): generic TCP-over-P2P multiplexing (`net/tunnel/`) + full-duplex loss-recovery hardening + coordination session recycling. Library layer for [alt-p2p-lore](https://github.com/sync-different/alt-p2p-lore); not yet exposed as a CLI subcommand.
+- **Host longevity** (v0.6.0): `DatagramSocket` fd-leak fix + coord keepalive + `--peer-wait` / wait-forever host mode — see "Long-Lived Hosts" above. Consumed by alt-p2p-bbs and alt-p2p-lore, which **shade** this JAR: bumping the version here means bumping `<alt-p2p.version>` in both sibling poms and rebuilding their fat JARs.
 - **Deferred (L2)**: robust in-run reconnect across symmetric NAT / relay (coord dead-peer eviction + peer-id re-register, relay re-pair)
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for full design documentation.

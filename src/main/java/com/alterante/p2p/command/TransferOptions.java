@@ -49,4 +49,8 @@ public class TransferOptions {
     @CommandLine.Option(names = "--batch-deadline",
             description = "Overall wall-clock budget in seconds for a folder transfer incl. reconnects (default: 600)")
     public Integer batchDeadlineSec;
+
+    @CommandLine.Option(names = "--peer-wait",
+            description = "Seconds to wait for the peer to join before giving up; 0 = wait forever (default: 120)")
+    public Integer peerWaitSeconds;
 }

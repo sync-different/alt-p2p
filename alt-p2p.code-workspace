@@ -5,6 +5,30 @@
 		},
 		{
 			"path": "../alt-p2p-ui"
+		},
+		{
+			"path": "../alt-p2p-lore"
+		},
+		{
+			"path": "../alt-p2p-lore-vscode"
+		},
+		{
+			"path": "../alt-p2p-bbs"
+		},
+		{
+			"path": "../alt-bbs-server"
+		},
+		{
+			"path": "../alt-website-bbs"
+		},
+		{
+			"path": "../alt-website-lore"
+		},
+		{
+			"path": "../alt-sec-audit"
+		},
+		{
+			"path": "../alt-bbs-deploy"
 		}
 	],
 	"settings": {}
