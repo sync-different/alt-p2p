@@ -52,14 +52,41 @@ public class ForwardListener implements Closeable {
 
     private void acceptLoop() {
         while (!closed) {
+            Socket sock = null;
             try {
-                Socket sock = server.accept();
+                sock = server.accept();
                 sock.setTcpNoDelay(true);
                 StreamMux.MuxStream stream = mux.open(target);
                 Bridge.bridge(sock, stream, exec);
             } catch (IOException e) {
-                if (!closed) log.debug("accept failed: {}", e.getMessage());
+                // The accepted socket is ours until Bridge takes it. If mux.open() throws — the
+                // carrier died, which is exactly when a caller keeps retrying — the connection was
+                // dropped on the floor still open, costing a file descriptor every time and leaving
+                // the client connected to nothing. Enough of those reach the process fd limit, at
+                // which point accept() starts failing immediately and this loop spins at full CPU
+                // logging at DEBUG, where nobody sees it. The two faults feed each other.
+                closeQuietly(sock);
+                if (!closed) {
+                    log.debug("accept/open failed: {}", e.getMessage());
+                    pauseAfterFailure();
+                }
             }
+        }
+    }
+
+    private static void closeQuietly(Socket sock) {
+        if (sock != null) {
+            try { sock.close(); } catch (IOException ignored) { }
+        }
+    }
+
+    /** Brief pause so a persistently failing accept cannot become a busy loop. */
+    private void pauseAfterFailure() {
+        try {
+            Thread.sleep(50);
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            closed = true;
         }
     }
 

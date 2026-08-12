@@ -136,42 +136,74 @@ public class TcpRelayServer {
 
             log.info("TCP relay AUTH success from {} for session '{}'", client.getRemoteSocketAddress(), sessionId);
 
-            // Try to pair with an existing pending peer.
-            PendingPeer existing = pendingPeers.remove(sessionId);
+            // Decide atomically whether to pair with a parked peer or become the parked peer.
+            //
+            // This was `remove()` followed by `put()`, which is not atomic even on a
+            // ConcurrentHashMap. Two peers that authenticate before either parks both saw an empty
+            // slot, so both parked — and the second put **silently overwrote** the first, leaving
+            // that peer referenced by nothing: unreachable by the pairing path and invisible to the
+            // reaper, which scans this map. It waited out its 30s client timeout ("Read timed out")
+            // while its socket leaked here.
+            //
+            // Rare in production only because the failed hole punch delays arrivals by ~10s.
+            // `--force-relay` skips the punch, so both peers arrive together and hit it every time:
+            // scripts/loopback.sh RELAY=1 failed 3/3 before this fix and 2/2 on 0.7.0.
+            //
+            // compute() is atomic per key. The liveness probe runs inside it and briefly holds that
+            // key's bin lock, which is acceptable at a bounded 5ms; everything slower — AUTH_OK,
+            // the splice — happens after it returns.
+            PendingPeer mine = new PendingPeer(client,
+                    new PushbackInputStream(client.getInputStream(), 1), System.currentTimeMillis());
+            PendingPeer[] partner = new PendingPeer[1];
+            PendingPeer[] stale = new PendingPeer[1];
+
+            pendingPeers.compute(sessionId, (key, parked) -> {
+                if (parked == null) {
+                    return mine;                    // first arrival — park and wait
+                }
+                if (!isPeerAlive(parked)) {
+                    stale[0] = parked;              // corpse; replace it rather than splice to it
+                    return mine;
+                }
+                partner[0] = parked;                // live partner — take it and clear the slot
+                return null;
+            });
+
+            if (stale[0] != null) {
+                // THE BUG THIS GUARD EXISTS FOR. `isClosed()` alone is not a liveness test -- it is
+                // true only when WE closed the socket locally, so a peer whose process is gone still
+                // passes it. Splicing to that corpse yields 0 bytes in both directions and the live
+                // side fails with TLS handshake_failure(40) waiting for a hello nobody will send.
+                log.warn("TCP relay session '{}': discarding STALE parked peer {} (parked {}ms, no "
+                        + "longer alive); {} will wait for a fresh partner instead",
+                        sessionId, stale[0].socket().getRemoteSocketAddress(),
+                        System.currentTimeMillis() - stale[0].connectedAt(),
+                        client.getRemoteSocketAddress());
+                closeQuietly(stale[0].socket());
+            }
+
+            PendingPeer existing = partner[0];
             if (existing != null) {
                 long parkedMs = System.currentTimeMillis() - existing.connectedAt();
-                if (!isPeerAlive(existing)) {
-                    // THE BUG THIS GUARD EXISTS FOR. `isClosed()` alone is not a liveness test -- it is
-                    // true only when WE closed the socket locally, so a peer whose process is gone still
-                    // passes it. Splicing to that corpse yields 0 bytes in both directions and the live
-                    // side fails with TLS handshake_failure(40) waiting for a hello nobody will send.
-                    log.warn("TCP relay session '{}': discarding STALE parked peer {} (parked {}ms, no "
-                            + "longer alive); {} will wait for a fresh partner instead",
-                            sessionId, existing.socket().getRemoteSocketAddress(), parkedMs,
-                            client.getRemoteSocketAddress());
-                    closeQuietly(existing.socket());
-                    existing = null;
-                } else {
-                    log.info("TCP relay session '{}': both peers connected, starting splice "
-                            + "({} <-> {}, first peer waited {}ms)", sessionId,
-                            existing.socket().getRemoteSocketAddress(),
-                            client.getRemoteSocketAddress(), parkedMs);
-                    sendAuthOk(client);
-                    sendAuthOk(existing.socket());
+                log.info("TCP relay session '{}': both peers connected, starting splice "
+                        + "({} <-> {}, first peer waited {}ms)", sessionId,
+                        existing.socket().getRemoteSocketAddress(),
+                        client.getRemoteSocketAddress(), parkedMs);
+                sendAuthOk(client);
+                sendAuthOk(existing.socket());
 
-                    // Clear the timeout now that we're splicing
-                    client.setSoTimeout(0);
-                    existing.socket().setSoTimeout(0);
+                // Clear the timeout now that we're splicing
+                client.setSoTimeout(0);
+                existing.socket().setSoTimeout(0);
 
-                    startSplice(sessionId, existing.socket(), existing.in(), client, new PushbackInputStream(client.getInputStream(), 1));
-                }
-            }
-            if (existing == null) {
-                // First peer (or the parked one was stale) — wait for the partner.
+                // Reuse `mine.in()` rather than wrapping the stream again: the probe may have pushed
+                // a byte back into that exact PushbackInputStream, and a second wrapper would not
+                // see it. Handing the splice a different stream is how a byte goes missing.
+                startSplice(sessionId, existing.socket(), existing.in(), client, mine.in());
+            } else {
+                // We are parked (compute() installed `mine`) — the partner will splice us.
                 log.info("TCP relay session '{}': {} waiting for peer (held up to {}s)",
                         sessionId, client.getRemoteSocketAddress(), PAIR_TIMEOUT_MS / 1000);
-                pendingPeers.put(sessionId, new PendingPeer(client,
-                        new PushbackInputStream(client.getInputStream(), 1), System.currentTimeMillis()));
             }
 
         } catch (Exception e) {

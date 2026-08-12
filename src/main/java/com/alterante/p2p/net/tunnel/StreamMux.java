@@ -81,7 +81,14 @@ public class StreamMux implements Closeable {
      */
     public void awaitClosed() throws InterruptedException {
         Thread r = reader;
-        if (r != null) r.join();
+        if (r == null) {
+            // Returning quietly here would report "the session ended" the instant it was asked,
+            // before the session had begun — a host loop would spin, or exit believing its peer had
+            // gone. The same null-thread shape made BatchRunner's death-watcher fire immediately
+            // when it was started before the router. If there is no reader, that is a caller bug.
+            throw new IllegalStateException("StreamMux.start() was never called; nothing to await");
+        }
+        r.join();
     }
 
     /** Open a new outbound logical stream to the peer's default target. */
@@ -134,6 +141,21 @@ public class StreamMux implements Closeable {
                 if (type < 0) break; // pipe EOF
                 int id = din.readInt();
                 int len = din.readInt();
+
+                // Never allocate on an unvalidated length.
+                //
+                // The writer never emits a frame longer than MAX_FRAME — DATA is chunked to it and
+                // labels are a few bytes — so anything larger means the frame boundary has been
+                // lost, not that a big frame is coming. Trusting it allocates up to 2 GiB from four
+                // bytes of garbage and then blocks in readFully waiting for data that will never
+                // arrive: the process dies with an OutOfMemoryError, or hangs, in either case far
+                // from the desync that caused it. Failing the mux here says what actually happened.
+                if (len < 0 || len > MAX_FRAME) {
+                    log.warn("mux: frame length {} out of range (type={}, id={}) — "
+                            + "the stream is desynchronised; closing", len, type, id);
+                    break;
+                }
+
                 byte[] payload = null;
                 if (len > 0) {
                     payload = new byte[len];

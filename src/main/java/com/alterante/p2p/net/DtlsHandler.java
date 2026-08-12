@@ -215,16 +215,53 @@ public class DtlsHandler {
             }
 
             int effectiveTimeout = waitMillis > 0 ? waitMillis : this.waitMillis;
+
+            byte[] recvBuf = new byte[Packet.MAX_DATAGRAM];
+            DatagramPacket dgram = new DatagramPacket(recvBuf, recvBuf.length);
+
+            // Set the socket timeout exactly once, as the original did. The read path below must
+            // stay bit-for-bit identical when nothing is discarded: an earlier version of this
+            // recomputed the timeout on every iteration and measurably destabilised full-duplex
+            // loss recovery (FullDuplexSpikeTest went from 10/10 to 6/10), so the fast path is
+            // deliberately left alone.
             try {
                 socket.setSoTimeout(effectiveTimeout);
             } catch (SocketException e) {
                 throw new IOException("Failed to set timeout", e);
             }
 
-            byte[] recvBuf = new byte[Packet.MAX_DATAGRAM];
-            DatagramPacket dgram = new DatagramPacket(recvBuf, recvBuf.length);
+            // Bound the *discard* path only, and only once something has actually been discarded.
+            //
+            // Every `continue` below throws a packet away and waits again with a fresh timeout, so
+            // a steady trickle of discardable traffic can keep this method from ever returning.
+            // That is not hypothetical where it matters most: the peer is still sending PUNCHes at
+            // 100ms intervals when the handshake begins and each one is filtered here — and timing
+            // out is how BouncyCastle learns to retransmit a lost flight, so starving it of
+            // timeouts turns one lost datagram into a hang that only the 30s deadline ends.
+            //
+            // Staying zero until the first discard keeps the common case free of any extra clock
+            // reads, and means a normal receive is unaffected by this bound entirely.
+            long firstDiscardAt = 0;
 
             while (true) {
+                if (firstDiscardAt != 0 && effectiveTimeout > 0
+                        && System.currentTimeMillis() - firstDiscardAt >= effectiveTimeout) {
+                    tlog.trace("Receive timeout ({}ms, exhausted by discarded packets)",
+                            effectiveTimeout);
+                    throw new SocketTimeoutException("Receive timed out");
+                }
+
+                // Restore the buffer capacity before every receive.
+                //
+                // DatagramPacket.receive() sets the packet's length to the bytes actually received,
+                // and that length is also the cap for the *next* receive on the same object. Reusing
+                // it across loop iterations therefore silently shrinks the buffer to the size of the
+                // last datagram. That is not a corner case here: the NAT keepalives sent between the
+                // hole punch and the handshake are **one byte**, they arrive on this socket, and the
+                // filter below discards them — so the ClientHello immediately after would be
+                // truncated to a single byte and the handshake would fail for no visible reason.
+                dgram.setLength(recvBuf.length);
+
                 try {
                     socket.receive(dgram);
                 } catch (SocketTimeoutException e) {
@@ -242,6 +279,7 @@ public class DtlsHandler {
                     // In relay mode, accept COORD_RELAY packets from the coord server
                     if (!from.equals(relayServer)) {
                         tlog.debug("Relay mode: ignoring packet from {} (expected relay server {})", from, relayServer);
+                        if (firstDiscardAt == 0) firstDiscardAt = System.currentTimeMillis();
                         continue;
                     }
                     // Unwrap COORD_RELAY
@@ -249,6 +287,7 @@ public class DtlsHandler {
                         Packet relayPkt = PacketCodec.decode(recvBuf, dgram.getLength());
                         if (relayPkt.type() != PacketType.COORD_RELAY) {
                             tlog.debug("Relay mode: ignoring non-relay packet type {}", relayPkt.type());
+                            if (firstDiscardAt == 0) firstDiscardAt = System.currentTimeMillis();
                             continue;
                         }
                         byte[] inner = relayPkt.payload();
@@ -258,12 +297,14 @@ public class DtlsHandler {
                         return copyLen;
                     } catch (PacketException e) {
                         tlog.debug("Relay mode: bad packet from server: {}", e.getMessage());
+                        if (firstDiscardAt == 0) firstDiscardAt = System.currentTimeMillis();
                         continue;
                     }
                 } else {
                     // Direct mode: accept packets from the remote peer only
                     if (!from.equals(remote)) {
                         tlog.debug("Ignoring packet from {} (expected {})", from, remote);
+                        if (firstDiscardAt == 0) firstDiscardAt = System.currentTimeMillis();
                         continue;
                     }
 
@@ -274,6 +315,7 @@ public class DtlsHandler {
                         if (firstByte < 0x14 || firstByte > 0x17) {
                             tlog.debug("Filtering non-DTLS packet (first byte: 0x{}, {} bytes)",
                                     String.format("%02X", firstByte), dgram.getLength());
+                            if (firstDiscardAt == 0) firstDiscardAt = System.currentTimeMillis();
                             continue;
                         }
                     }

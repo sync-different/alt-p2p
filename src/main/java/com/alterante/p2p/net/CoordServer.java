@@ -38,6 +38,11 @@ public class CoordServer {
     private final int sessionTimeoutMs;
     private final Map<String, Session> sessions = new ConcurrentHashMap<>();
     private final AtomicBoolean running = new AtomicBoolean(false);
+    private final java.util.concurrent.atomic.AtomicLong relayedPackets =
+            new java.util.concurrent.atomic.AtomicLong();
+    /** When the reaper last ran, so it fires on a schedule instead of only when the socket idles. */
+    private volatile long lastCleanupAt = System.currentTimeMillis();
+    private static final long CLEANUP_INTERVAL_MS = 1000;
     private DatagramSocket socket;
 
     public CoordServer(int port, String psk, int sessionTimeoutSeconds) {
@@ -47,8 +52,9 @@ public class CoordServer {
     }
 
     public void start() throws IOException {
-        socket = new DatagramSocket(port);
-        socket.setSoTimeout(1000); // 1s timeout for clean shutdown checks
+        DatagramSocket bound = new DatagramSocket(port);
+        bound.setSoTimeout(1000); // 1s timeout for clean shutdown checks
+        socket = bound;
         running.set(true);
         log.info("Coordination server listening on UDP port {}", port);
 
@@ -61,6 +67,21 @@ public class CoordServer {
             } catch (SocketTimeoutException e) {
                 cleanExpiredSessions();
                 continue;
+            } catch (SocketException e) {
+                // stop() closes the socket to break this receive immediately. Only a close we asked
+                // for is clean — anything else is a real error and must not be swallowed.
+                if (!running.get()) {
+                    break;
+                }
+                throw e;
+            }
+
+            // Cleanup must NOT depend on the socket going idle. A peer retrying faster than the
+            // socket timeout keeps this loop busy forever, and the session it is waiting on can then
+            // never expire — the retry waiting for expiry is what prevents it. Seen in production:
+            // a host locked out of its own session indefinitely.
+            if (System.currentTimeMillis() - lastCleanupAt >= CLEANUP_INTERVAL_MS) {
+                cleanExpiredSessions();
             }
 
             InetSocketAddress sender = new InetSocketAddress(dgram.getAddress(), dgram.getPort());
@@ -77,12 +98,36 @@ public class CoordServer {
         log.info("Coordination server stopped");
     }
 
+    /**
+     * Stop the receive loop and release the port.
+     *
+     * <p>Closing the socket here rather than only clearing the flag matters twice: the loop wakes at
+     * once instead of after up to the 1s socket timeout, and the port is free the moment this returns
+     * — so a supervisor restarting the coordinator on the same port cannot lose the bind race with
+     * its own predecessor. It is also the only path that releases the socket when {@code start()}
+     * itself threw.
+     */
     public void stop() {
         running.set(false);
+        DatagramSocket s = socket;
+        if (s != null) {
+            s.close();
+        }
     }
 
     public boolean isRunning() {
         return running.get();
+    }
+
+    /**
+     * Datagrams forwarded between peers on the UDP relay path since startup.
+     *
+     * <p>Worth having beyond tests: this is the one number that says whether a coordinator is merely
+     * introducing peers or carrying their traffic, which is the difference between negligible load
+     * and saturating its uplink.
+     */
+    public long relayedPackets() {
+        return relayedPackets.get();
     }
 
     private void handlePacket(Packet packet, InetSocketAddress sender) {
@@ -137,6 +182,11 @@ public class CoordServer {
                 // operations), so recycle the slots instead of rejecting.
                 log.info("Session '{}' already paired; recycling for a new rendezvous", sessionId);
                 session.reset();
+            } else if (session.reclaimStaleUnauthenticated(unauthenticatedGraceMs()) > 0) {
+                // A slot was held by a peer that registered and never authenticated. It proved
+                // nothing, and session expiry can never reclaim it while a healthy partner keeps
+                // the session alive — so reclaim it here rather than lock out a real peer.
+                log.info("Session '{}': reclaimed a slot from a peer that never authenticated", sessionId);
             } else {
                 sendError(sender, (short) 0x0001, "Session full");
                 return;
@@ -181,17 +231,33 @@ public class CoordServer {
         }
 
         Session.PeerSlot slot = session.findPeer(sender);
-        if (slot == null) {
-            sendError(sender, (short) 0x0002, "Not registered");
-            return;
-        }
-
-        // Verify HMAC-SHA256(psk, nonce + session_id)
-        byte[] expectedHmac = computeHmac(psk, slot.nonce, sessionId);
-        if (!MessageDigest.isEqual(receivedHmac, expectedHmac)) {
-            log.warn("AUTH failed from {} for session '{}'", sender, sessionId);
-            sendError(sender, (short) 0x0002, "Authentication failed");
-            return;
+        if (slot != null) {
+            // Verify HMAC-SHA256(psk, nonce + session_id)
+            byte[] expectedHmac = computeHmac(psk, slot.nonce, sessionId);
+            if (!MessageDigest.isEqual(receivedHmac, expectedHmac)) {
+                log.warn("AUTH failed from {} for session '{}'", sender, sessionId);
+                sendError(sender, (short) 0x0002, "Authentication failed");
+                return;
+            }
+        } else {
+            // No slot at this address. Before rejecting, consider that the peer's NAT may have
+            // remapped its port between REGISTER and AUTH — a mapping can expire or move mid-exchange
+            // — in which case the registration is real and only its address is stale. The HMAC
+            // settles it: it is computed over a nonce we issued to one specific slot, so a peer that
+            // produces a valid one for that slot is the peer we issued it to, whatever address it
+            // now speaks from. Only unauthenticated slots are candidates, so this can never displace
+            // an established peer.
+            slot = matchByProof(session, sessionId, receivedHmac);
+            if (slot == null) {
+                log.info("AUTH from {} for session '{}' matches no slot (registered peers: {})",
+                        sender, sessionId, describePeers(session));
+                sendError(sender, (short) 0x0002, "Not registered");
+                return;
+            }
+            log.info("AUTH from {} for session '{}' proved the slot registered as {} — "
+                            + "NAT remapped the port mid-handshake; following it",
+                    sender, sessionId, slot.endpoint);
+            slot.rebind(sender);
         }
 
         slot.authenticated = true;
@@ -220,15 +286,98 @@ public class CoordServer {
         }
     }
 
+    /**
+     * Refresh the session a waiting peer belongs to — or tell it that it no longer has one.
+     *
+     * <p>A long-lived host sits in {@code waitForPeerInfo()} for hours, keepaliving every 90s and
+     * expecting silence. Silence is therefore indistinguishable from "the coordinator has never heard
+     * of you": if the coordinator restarts, or the session is dropped, the host waits <em>forever</em>
+     * on a registration that no longer exists while its logs look perfectly healthy. Meanwhile a
+     * client registers a fresh session and waits for a peer that can never arrive.
+     *
+     * <p>So an unattributable keepalive is answered with an error. {@code CoordClient} already treats
+     * COORD_ERROR while waiting as fatal, which unwinds to the supervising loop and re-registers. The
+     * healthy case stays silent — answering every keepalive would double the idle traffic of every
+     * host on the fleet for nothing.
+     */
     private void handleKeepalive(Packet packet, InetSocketAddress sender) {
-        // Find which session this peer belongs to and touch it
-        for (Session session : sessions.values()) {
-            Session.PeerSlot slot = session.findPeer(sender);
-            if (slot != null && slot.authenticated) {
-                session.touch();
-                break;
+        // The session id is optional: peers before 0.7.1 send an empty payload, and are attributed by
+        // endpoint alone.
+        String sessionId = tryParseSessionId(packet.payload());
+
+        if (sessionId != null) {
+            Session session = sessions.get(sessionId);
+            if (session != null && touchIfAuthenticated(session, sender)) {
+                return;
+            }
+        } else {
+            for (Session session : sessions.values()) {
+                if (touchIfAuthenticated(session, sender)) {
+                    return;
+                }
             }
         }
+
+        // Not an error on the peer's part — its registration is simply gone. Log at INFO: this is the
+        // one line that explains an otherwise invisible "host waited forever" report.
+        log.info("KEEPALIVE from {} matches no authenticated registration for {} — "
+                        + "rejecting so the peer re-registers",
+                sender, sessionId == null ? "any session" : "session '" + sessionId + "'");
+        sendError(sender, (short) 0x0003, "Not registered — re-register");
+    }
+
+    /**
+     * Find the unauthenticated slot whose nonce this HMAC was computed over, or null.
+     *
+     * <p>Every candidate is checked with a constant-time compare, and the loop is not short-circuited
+     * on a mismatch beyond moving to the next slot — with at most two slots there is nothing to leak.
+     */
+    private Session.PeerSlot matchByProof(Session session, String sessionId, byte[] receivedHmac) {
+        for (Session.PeerSlot candidate : session.unauthenticatedPeers()) {
+            byte[] expected = computeHmac(psk, candidate.nonce, sessionId);
+            if (MessageDigest.isEqual(receivedHmac, expected)) {
+                return candidate;
+            }
+        }
+        return null;
+    }
+
+    /** Registered endpoints and their auth state — the context a failed AUTH needs to be diagnosed. */
+    private static String describePeers(Session session) {
+        StringBuilder sb = new StringBuilder();
+        for (Session.PeerSlot slot : session.peers()) {
+            if (sb.length() > 0) {
+                sb.append(", ");
+            }
+            sb.append(slot.endpoint).append(slot.authenticated ? " (auth)" : " (pending)");
+        }
+        return sb.length() == 0 ? "none" : sb.toString();
+    }
+
+    /** Touch the session if {@code sender} holds an authenticated slot in it. */
+    private boolean touchIfAuthenticated(Session session, InetSocketAddress sender) {
+        Session.PeerSlot slot = session.findPeer(sender);
+        if (slot != null && slot.authenticated) {
+            session.touch();
+            log.debug("KEEPALIVE from {} refreshed session '{}'", sender, session.sessionId());
+            return true;
+        }
+        return false;
+    }
+
+    /** Session id from a {@code len:u16 + utf8} payload, or null if absent or malformed. */
+    private static String tryParseSessionId(byte[] payload) {
+        if (payload == null || payload.length < 2) {
+            return null;
+        }
+        ByteBuffer buf = ByteBuffer.wrap(payload).order(ByteOrder.BIG_ENDIAN);
+        int idLen = Short.toUnsignedInt(buf.getShort());
+        if (idLen <= 0 || idLen > payload.length - 2) {
+            return null;
+        }
+        byte[] idBytes = new byte[idLen];
+        buf.get(idBytes);
+        return new String(idBytes, StandardCharsets.UTF_8);
     }
 
     /**
@@ -249,8 +398,11 @@ public class CoordServer {
             if (slot != null && slot.authenticated) {
                 Session.PeerSlot other = session.getOtherPeer(sender);
                 if (other != null && other.authenticated) {
-                    // Forward: wrap the same payload in a COORD_RELAY to the other peer
-                    log.info("Relay: {} -> {} ({} bytes)", sender, other.endpoint, payload.length);
+                    // Forward: wrap the same payload in a COORD_RELAY to the other peer.
+                    // DEBUG, not INFO: this fires once per datagram on the relay data path — at INFO
+                    // a single transfer writes millions of lines and the log becomes the bottleneck.
+                    log.debug("Relay: {} -> {} ({} bytes)", sender, other.endpoint, payload.length);
+                    relayedPackets.incrementAndGet();
                     sendPacket(other.endpoint, new Packet(PacketType.COORD_RELAY, payload));
                     session.touch();
                 } else {
@@ -352,7 +504,13 @@ public class CoordServer {
         }
     }
 
+    /** A grace no longer than the session's own lifetime, so it always has a chance to fire. */
+    private long unauthenticatedGraceMs() {
+        return Math.min(Session.UNAUTHENTICATED_GRACE_MS, sessionTimeoutMs);
+    }
+
     private void cleanExpiredSessions() {
+        lastCleanupAt = System.currentTimeMillis();
         long now = System.currentTimeMillis();
         sessions.entrySet().removeIf(entry -> {
             boolean expired = (now - entry.getValue().lastActivity()) > sessionTimeoutMs;
@@ -361,5 +519,16 @@ public class CoordServer {
             }
             return expired;
         });
+        // Also reclaim dead slots inside sessions that are still alive: a session kept warm by one
+        // healthy peer never expires, so without this a slot lost to an unauthenticated peer would
+        // be held for as long as its partner keeps running.
+        long grace = unauthenticatedGraceMs();
+        for (Map.Entry<String, Session> e : sessions.entrySet()) {
+            int freed = e.getValue().reclaimStaleUnauthenticated(grace);
+            if (freed > 0) {
+                log.info("Session '{}': reclaimed {} slot(s) from peers that never authenticated",
+                        e.getKey(), freed);
+            }
+        }
     }
 }

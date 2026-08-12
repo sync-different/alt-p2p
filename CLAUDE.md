@@ -11,8 +11,8 @@ Peers connect through a lightweight coordination server, punch through NATs, est
 ## Build & Test
 
 ```bash
-mvn package          # Build fat JAR → target/alt-p2p-0.6.0-SNAPSHOT.jar
-mvn test             # Run all tests (JUnit 5) — 120 run, 0 failures, 3 skipped (disabled stress spikes)
+mvn package          # Build fat JAR → target/alt-p2p-0.7.1-SNAPSHOT.jar
+mvn clean test       # Run all tests (JUnit 5) — 149 run, 0 failures, 3 skipped (disabled stress spikes)
 
 mvn test -Dtest=ReliableChannelTest              # one test class
 mvn test -Dtest=ReliableChannelTest#sackRetransmit  # one test method
@@ -43,16 +43,16 @@ multi-file run pass/fail (symlinks are excluded at the source and must be **abse
 
 ```bash
 # Coordination server (also starts TCP relay on port+1)
-java -jar target/alt-p2p-0.6.0-SNAPSHOT.jar server --psk <key>
+java -jar target/alt-p2p-0.7.1-SNAPSHOT.jar server --psk <key>
 
 # Send a file (direct UDP)
-java -jar target/alt-p2p-0.6.0-SNAPSHOT.jar send -s <session> --psk <key> --server <host:port> -f <file>
+java -jar target/alt-p2p-0.7.1-SNAPSHOT.jar send -s <session> --psk <key> --server <host:port> -f <file>
 
 # Send with TCP relay fallback (if hole punching fails)
-java -jar target/alt-p2p-0.6.0-SNAPSHOT.jar send -s <session> --psk <key> --server <host:port> -f <file> --allow-relay --relay-mode tcp
+java -jar target/alt-p2p-0.7.1-SNAPSHOT.jar send -s <session> --psk <key> --server <host:port> -f <file> --allow-relay --relay-mode tcp
 
 # Receive a file
-java -jar target/alt-p2p-0.6.0-SNAPSHOT.jar receive -s <session> --psk <key> --server <host:port> -o <dir>
+java -jar target/alt-p2p-0.7.1-SNAPSHOT.jar receive -s <session> --psk <key> --server <host:port> -o <dir>
 ```
 
 ## Architecture
@@ -188,6 +188,129 @@ When hole punching fails (symmetric-to-symmetric NAT), peers can fall back to TC
 - Performance: ~15 MB/s via TCP relay (28x faster than UDP relay's 530 KB/s), compared to ~5 MB/s SCP to the same VPS.
 - Stream protocol: length-prefixed messages `type(1B) + length(4B BE) + payload`. Types: AUTH, AUTH_OK, FILE_OFFER, FILE_ACCEPT, DATA (64KB), COMPLETE, VERIFIED.
 
+### Session Slot Reclamation (v0.7.1)
+
+Fixes a bug that made a coordinator session **permanently unusable** — a lore host locked out of its
+own session, retrying `Session full` once per second, with no escape but stopping the host for five
+minutes or restarting the coordinator (dropping every live relay splice).
+
+Three behaviours combined:
+
+1. **`addPeer()` claims a slot at REGISTER**, before the peer proves it holds the PSK. A peer that
+   dies then — wrong key, crash, network loss — keeps that slot.
+2. **Only a `bothAuthenticated()` session recycles**, so one live peer plus one dead unauthenticated
+   peer never qualifies.
+3. **`cleanExpiredSessions()` ran only on `SocketTimeoutException`** — i.e. when the receive socket
+   went idle. A peer retrying faster than that timeout starved the reaper, so *the retry waiting for
+   expiry was what prevented it*. On a busy coordinator the socket may rarely idle at all.
+
+Note that (1) alone is survivable: an idle coordinator expires the whole session and takes the dead
+slot with it. It becomes permanent only when a healthy partner's keepalives keep the session alive —
+which is exactly what a long-lived host does. The first version of the regression test missed this
+and **passed against the broken code**; it had to be rewritten around a keepaliving peer.
+
+The fix, in two independent halves:
+
+- **`Session.reclaimStaleUnauthenticated(graceMs)`** — drops slots held by peers that registered but
+  never authenticated. Called both on REGISTER (so a real peer is never rejected for a corpse) and
+  from the reaper (so slots free even with no new traffic). The grace is
+  `min(10s, sessionTimeout)` — never longer than the session's own lifetime, or it could never fire.
+- **The reaper now runs on a deadline**, checked in the packet loop, not only when the socket idles.
+  Cleanup must not depend on traffic patterns.
+
+An **authenticated** peer is never reclaimed, however long it idles — that is what a waiting host
+looks like, and `CoordSessionReclaimTest` pins it.
+
+### Connectivity Hardening (v0.7.1)
+
+A deliberate corner-case audit of the connection path, class by class. Seven independent faults, each
+one able to fail or hang a connection on its own. Every fix has a regression test that was **verified
+to fail against the old code** — several of the bugs had existed for releases precisely because the
+obvious test passes either way.
+
+The recurring shapes, worth recognising elsewhere in this codebase:
+
+- **A wait that never expires.** `CoordClient.receive()` and `DtlsHandler`'s transport both restarted
+  their timeout on every discarded packet, so a steady trickle of ignorable traffic held the call
+  open indefinitely. Both now compute one deadline per call. This is not theoretical for DTLS: the
+  peer is still punching at 100ms intervals when the handshake starts and every PUNCH is filtered
+  there — and **a timeout is how BouncyCastle learns to retransmit a lost flight**, so starving it of
+  timeouts turns one lost datagram into a hang to the 30s deadline.
+- **Silence used as a signal.** A `COORD_KEEPALIVE` the coordinator cannot attribute was ignored, and
+  silence is exactly what a healthy keepalive gets — so a host whose registration was dropped (a
+  coordinator restart) waited **forever** while logging perfectly normally, and a client on a fresh
+  session waited for a peer that could never arrive. Unattributable keepalives are now answered with
+  `COORD_ERROR`, which `waitForPeerInfo()` already treats as fatal, so the supervising loop
+  re-registers. A live registration still gets silence — answering every keepalive would double the
+  idle traffic of every host on the fleet.
+- **Identity confused with address.** AUTH was matched by sender endpoint, so a NAT that remapped the
+  port between REGISTER and AUTH produced "Not registered" while the peer's own slot sat there, and
+  the abandoned slot counted against `MAX_PEERS`. The HMAC is the identity — computed over a nonce
+  issued to one specific slot — so AUTH now falls back to matching by proof and moves the slot to the
+  address the peer is speaking from. **Only unauthenticated slots are candidates**: everyone shares
+  the PSK, so allowing it on an established slot would let any peer redirect another's session.
+- **A flag that was never set.** `PeerConnection.connect()` declared `boolean useRelay = false` and
+  never assigned it, so `--relay-mode udp` logged "falling back to UDP relay" and then ran an ordinary
+  direct handshake against the endpoint the punch had just failed to reach. Three `useRelay` branches
+  existed for a value that could not be true. **No test caught it because on loopback the direct path
+  succeeds** — `UdpRelayFallbackTest` had to assert on `CoordServer.relayedPackets()` (added for
+  this, and worth having: it is the number that says whether a coordinator is introducing peers or
+  carrying their traffic).
+- **Trusting an unauthenticated source.** The coordination socket is unconnected and is the same one
+  that hole-punches moments later, so it hears from the peer and from anything else probing the port.
+  A forged `COORD_ERROR` ended an hours-long wait, and a forged `PEER_INFO` was **adopted outright** —
+  the test confirmed the peer endpoint becoming an arbitrary attacker-chosen address. `receive()` now
+  discards datagrams that did not come from the coordinator. Note the deployment caveat: a
+  **multi-homed coordinator** replying from a different source IP than it was dialled on would now be
+  ignored, which is why that discard logs at INFO — it is the only line that would explain it.
+- **Success proved only one way.** Receiving a PUNCH is itself success, so whichever peer gets one
+  first moves straight to DTLS and thereafter discards non-DTLS datagrams. If its PUNCH_ACK was lost,
+  the other side punched to timeout while the first sat in a handshake nobody could complete — one
+  lost datagram, both sides broken. A DTLS record is proof of exactly what the punch wants, so it now
+  counts as success (content type **and** version checked, so noise cannot end a punch).
+- **Sockets orphaned on the retried path.** `TcpRelayClient.connect()` throws before the caller holds
+  the object, so nothing else can close its socket — the same shape as the 0.6.0 `DatagramSocket` leak
+  that cost a waiting host 758 fds, on the path the reconnect loop retries. It also ran the TLS
+  handshake with `setSoTimeout(0)`: a partner that authenticates and then goes quiet pinned the thread
+  forever, and a host stuck there never returns to waiting for peers. Now bounded (60s) and closed on
+  every failure path.
+
+**Relay pairing race** (found by `scripts/loopback.sh RELAY=1`, which no unit test replaced):
+`TcpRelayServer` paired peers with `pendingPeers.remove()` followed by `put()` — not atomic, even on
+a `ConcurrentHashMap`. Two peers that authenticate before either parks both see an empty slot and both
+park, and **the second put silently overwrites the first**, leaving that peer referenced by nothing:
+unreachable by the pairing path and invisible to the reaper, which scans that same map. It waits out
+its client's 30s `AUTH_OK` timeout ("Read timed out") while its socket leaks server-side. Now one
+atomic `compute()` — pair with a live parked peer, replace a stale one, or park — with AUTH_OK and the
+splice kept outside the lambda.
+
+Production hid this because a failed hole punch staggers arrivals by ~10s; `--force-relay` skips the
+punch, so both peers arrive together and hit it **every time** (`RELAY=1` failed 3/3 on 0.7.0, passes
+3/3 now). Every pre-existing test in `TcpRelayServerTest` connects peers sequentially, so the second
+arrival always found the first already parked — `peersArrivingSimultaneouslyArePaired` releases both
+AUTHs from one latch, and fails on the old code in round 0.
+
+Tunnel layer, same audit:
+
+- **`StreamMux` allocated on an unvalidated length.** Four bytes of garbage from a desynchronised
+  stream became a 2 GiB allocation followed by a `readFully` for data that would never arrive — OOM or
+  hang, far from the desync. Frames longer than `MAX_FRAME` are impossible from the writer, so they
+  now end the mux with a WARN naming the length.
+- **`ForwardListener` leaked the accepted socket** when `mux.open()` failed — i.e. when the carrier
+  had died, which is exactly when clients keep retrying — and spun at full CPU if `accept()` kept
+  failing. The two faults feed each other into the fd limit. Both fixed.
+- **`StreamMux.awaitClosed()` returned immediately if `start()` was never called**, reporting "the
+  session ended" before it began. Now an `IllegalStateException` — the same null-thread shape that
+  made `BatchRunner`'s death-watcher false-fire when started before the router.
+
+Also: `CoordServer.stop()` never closed its socket (so a restart could lose the bind race with its
+own predecessor, and a failed `start()` leaked the fd), and the UDP relay data path logged **INFO per
+datagram**.
+
+**Testing note:** `mvn test` was observed running **stale IDE-compiled classes** and reporting success
+while executing Eclipse JDT error stubs (`java.lang.Error: Unresolved compilation problem`). Use
+`mvn clean test` when a result matters.
+
 ### Named Tunnel Targets (v0.7.0)
 
 One session can forward **several** host services. `StreamMux.open(target)` puts a UTF-8 label in the
@@ -287,6 +410,23 @@ Events: `status`, `file_info`, `progress`, `complete`, `error`, `log`. Folder tr
   are untouched and there is no protocol change, so a 0.6.1 relay serves 0.5.0/0.6.0 peers unchanged and
   only the coordinator needs the new jar. Deployed to demo7 2026-08-10 (0.5.0 → 0.6.1, verified by the
   reaper firing at 30s).
+- **Session slot reclamation** (v0.7.1): a peer that registers and dies no longer wedges a session
+  permanently — see above. This part is coordinator-side only, but **v0.7.1 as a whole is NOT** — see
+  the next entry before deciding what to deploy.
+- **Connectivity hardening** (v0.7.1): seven connection-path faults + three tunnel faults — see
+  "Connectivity Hardening" above. **Both sides change**, unlike 0.6.1 and unlike the reclamation work
+  above: `CoordServer`/`Session` are coordinator-side, while `CoordClient`, `HolePuncher`,
+  `PeerConnection`, `DtlsHandler`, `TcpRelayClient` and `net/tunnel/` are all peer-side. Upgrading only
+  the coordinator gets the session/keepalive fixes and none of the rest.
+  - Wire-compatible in both directions. `COORD_KEEPALIVE` now carries the session id, which an older
+    coordinator ignores; an older peer sends it empty and is still attributed by endpoint.
+  - **Expect one-off churn on first deploy.** A coordinator that cannot attribute a keepalive now
+    answers `COORD_ERROR` instead of staying silent, so every peer holding a stale registration —
+    including peers on older jars — will tear down and re-register. That is the fix working, not a
+    fault.
+  - **Deployment caveat:** peers now ignore coordination datagrams that did not come from the address
+    they dialled. A **multi-homed coordinator** replying from a different source IP would be ignored
+    entirely; the discard logs at INFO precisely so that case is diagnosable.
 - **Named tunnel targets** (v0.7.0): one mux carries several forwarded services — see above. Additive
   and wire-compatible; **`alt-p2p-lore` and `alt-p2p-bbs` both shade 0.7.0-SNAPSHOT**, so bumping here
   means bumping `<alt-p2p.version>` in both and rebuilding their fat jars.

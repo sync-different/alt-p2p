@@ -107,6 +107,25 @@ public class HolePuncher {
                 packetsReceived++;
                 log.debug("Received packet from {} ({} bytes)", from, dgram.getLength());
 
+                // The peer has already finished punching and started the handshake.
+                //
+                // This is what a lost PUNCH_ACK looks like, and without this branch it strands both
+                // sides: our PUNCH reached the peer, so it declared success and moved on, but its
+                // reply did not reach us. It will not send another — once in DTLS it discards our
+                // remaining PUNCHes as non-DTLS — so we would punch on to the timeout and report
+                // failure, while the peer sat in a handshake that could never complete. One lost
+                // datagram, both sides broken, and nothing in either log saying why.
+                //
+                // A DTLS record is proof of exactly what the punch is trying to establish: the peer
+                // is reachable at this address and is talking to us. Dropping the record costs
+                // nothing — DTLS retransmits its handshake.
+                if (isDtlsRecord(recvBuf, dgram.getLength())) {
+                    long elapsed = System.currentTimeMillis() - startTime;
+                    log.info("Peer at {} is already handshaking after {}ms (PUNCH_ACK evidently lost) "
+                            + "— treating as punched", from, elapsed);
+                    return HolePunchResult.succeeded(from, elapsed);
+                }
+
                 // Validate the packet (magic + CRC) BEFORE trusting the source. A stray
                 // datagram (NAT keepalive byte, coord chatter, random noise) won't decode.
                 Packet packet;
@@ -155,6 +174,27 @@ public class HolePuncher {
             log.error("Hole punch I/O error: {}", e.getMessage());
             return HolePunchResult.failed(elapsed);
         }
+    }
+
+    /**
+     * True for a DTLS record: content type 0x14-0x17 followed by a DTLS version.
+     *
+     * <p>The version bytes are checked as well as the content type, because the type alone is one
+     * byte out of 256 and this decides whether to end the punch. {@code 0xFEFD} is DTLS 1.2 and
+     * {@code 0xFEFF} DTLS 1.0 — together with a plausible type and a full record header, a
+     * coincidental match from noise is not a practical concern.
+     */
+    private static boolean isDtlsRecord(byte[] buf, int length) {
+        if (length < 13) {      // a DTLS record header is 13 bytes
+            return false;
+        }
+        int type = buf[0] & 0xFF;
+        if (type < 0x14 || type > 0x17) {
+            return false;
+        }
+        int major = buf[1] & 0xFF;
+        int minor = buf[2] & 0xFF;
+        return major == 0xFE && (minor == 0xFD || minor == 0xFF);
     }
 
     /** A private/loopback/link-local address means no NAT was crossed — a direct LAN/local path, not a hole punch. */

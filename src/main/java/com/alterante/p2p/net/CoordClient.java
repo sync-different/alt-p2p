@@ -218,8 +218,18 @@ public class CoordClient {
         throw new CoordException("Timed out waiting for peer (" + (peerWaitMs / 1000) + "s)");
     }
 
+    /**
+     * Naming the session lets the coordinator attribute this keepalive in O(1) and, more importantly,
+     * say which registration is missing when it cannot. The payload is additive — a pre-0.7.1
+     * coordinator ignores it and attributes by sender endpoint exactly as before.
+     */
     private void sendKeepalive() throws CoordException {
-        send(new Packet(PacketType.COORD_KEEPALIVE, new byte[0]));
+        byte[] idBytes = sessionId.getBytes(StandardCharsets.UTF_8);
+        byte[] payload = new byte[2 + idBytes.length];
+        ByteBuffer.wrap(payload).order(ByteOrder.BIG_ENDIAN)
+                .putShort((short) idBytes.length)
+                .put(idBytes);
+        send(new Packet(PacketType.COORD_KEEPALIVE, payload));
     }
 
     private void handlePeerInfo(Packet packet) {
@@ -245,17 +255,61 @@ public class CoordClient {
         }
     }
 
+    /**
+     * Receive the next packet <em>from the coordinator</em>, discarding anything else.
+     *
+     * <p>This socket is not connected, and it is the same one that will hole-punch moments later, so
+     * it hears from more than the coordinator: the remote peer may already be punching (it gets
+     * PEER_INFO first and starts immediately), and anything else on the internet may probe the port.
+     * Taking those at face value is what makes a stray datagram able to end an hours-long wait —
+     * a COORD_ERROR aborts it, and a PEER_INFO would send the whole connection at an address of the
+     * sender's choosing.
+     *
+     * <p>Discarded packets do not extend the caller's timeout: the deadline is computed once, so a
+     * steady trickle of noise still surfaces as a timeout rather than blocking forever.
+     */
     private Packet receive() throws SocketTimeoutException, CoordException {
         byte[] buf = new byte[Packet.MAX_DATAGRAM];
-        DatagramPacket dgram = new DatagramPacket(buf, buf.length);
-        try {
-            socket.receive(dgram);
-            return PacketCodec.decode(buf, dgram.getLength());
-        } catch (SocketTimeoutException e) {
-            throw e;
-        } catch (IOException | PacketException e) {
-            throw new CoordException("Receive failed: " + e.getMessage(), e);
+        long deadline = System.currentTimeMillis() + RECV_TIMEOUT_MS;
+
+        while (true) {
+            long remaining = deadline - System.currentTimeMillis();
+            if (remaining <= 0) {
+                throw new SocketTimeoutException("Receive timed out");
+            }
+            DatagramPacket dgram = new DatagramPacket(buf, buf.length);
+            try {
+                socket.setSoTimeout((int) Math.max(1, remaining));
+                socket.receive(dgram);
+
+                InetSocketAddress from = (InetSocketAddress) dgram.getSocketAddress();
+                if (!isFromCoordinator(from)) {
+                    // INFO, not DEBUG: if a coordinator ever replies from an address other than the
+                    // one we sent to (a multi-homed host picking a different source IP), every reply
+                    // is dropped and nothing works. This line is the only thing that would say so.
+                    log.info("Ignoring {} byte datagram from {} — expected coordinator {}",
+                            dgram.getLength(), from, serverAddr);
+                    continue;
+                }
+                return PacketCodec.decode(buf, dgram.getLength());
+            } catch (SocketTimeoutException e) {
+                throw e;
+            } catch (PacketException e) {
+                // Undecodable from the coordinator's address: skip it rather than abort. Aborting
+                // here would let one corrupt datagram end a long wait.
+                log.debug("Discarding undecodable packet from coordinator: {}", e.getMessage());
+            } catch (IOException e) {
+                throw new CoordException("Receive failed: " + e.getMessage(), e);
+            }
         }
+    }
+
+    /** True if the datagram came from the coordinator we are talking to. */
+    private boolean isFromCoordinator(InetSocketAddress from) {
+        return from != null
+                && from.getPort() == serverAddr.getPort()
+                && from.getAddress() != null
+                && from.getAddress().equals(serverAddr.getAddress());
     }
 
     private String decodeError(Packet errorPacket) {

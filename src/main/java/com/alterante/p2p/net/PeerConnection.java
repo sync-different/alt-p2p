@@ -162,7 +162,16 @@ public class PeerConnection {
                         return; // skip DTLS/router setup
                     }
 
-                    // UDP relay path (existing)
+                    // UDP relay path: tunnel DTLS through the coordination server.
+                    //
+                    // This assignment was missing, which silently disabled the entire mode. The
+                    // three `useRelay` branches below exist for it — skip the NAT keepalive (there
+                    // is no direct path to keep open), keep the RELAYING state, and above all call
+                    // dtls.enableRelay(). With the flag stuck false, --relay-mode udp instead ran an
+                    // ordinary direct handshake against an endpoint the punch had just proved
+                    // unreachable, and failed three times over. The log said "falling back to UDP
+                    // relay" while no relay was ever used.
+                    useRelay = true;
                     setState(PeerState.RELAYING);
                 } else {
                     throw new RuntimeException("Hole punch failed after " + result.elapsedMs() + "ms");
