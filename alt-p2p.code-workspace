@@ -29,6 +29,9 @@
 		},
 		{
 			"path": "../alt-bbs-deploy"
+		},
+		{
+			"path": "../alt-p2p-lore-identity"
 		}
 	],
 	"settings": {}

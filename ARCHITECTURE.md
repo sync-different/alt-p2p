@@ -801,7 +801,10 @@ tunnel a `lore`/`loreserver` gRPC connection between two NAT'd machines.
   real operation opens several concurrent TCP connections (≥2 even with `--max-connections 1`)
   while a session provides one pipe. Wire frame: `type(1) | streamId(4 BE) | length(4 BE) |
   payload`; types `OPEN`, `DATA`, `CLOSE`. Stream ids are initiator-assigned and monotonic; the
-  acceptor handles inbound streams via an `onStream` callback. The carrier is already reliable
+  acceptor handles inbound streams via an `onStream` callback. **An OPEN frame may carry a
+    UTF-8 target label** in its payload (v0.7.0), so one session can forward several host services;
+    an empty payload means the acceptor's default target — which is what every OPEN carried before
+    the label existed, leaving the wire format unchanged for peers that never use it. The carrier is already reliable
   and ordered, so the mux only frames and demultiplexes. **M1 has no per-stream flow control** —
   a full carrier send window blocks the single frame writer, head-of-line blocking across
   streams (accepted; identical to gRPC over one HTTP/2 connection).

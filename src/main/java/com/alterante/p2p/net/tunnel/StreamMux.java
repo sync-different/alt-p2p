@@ -84,12 +84,28 @@ public class StreamMux implements Closeable {
         if (r != null) r.join();
     }
 
-    /** Open a new outbound logical stream (initiator side). */
+    /** Open a new outbound logical stream to the peer's default target. */
     public MuxStream open() throws IOException {
+        return open("");
+    }
+
+    /**
+     * Open a new outbound logical stream naming which of the peer's targets it is for.
+     *
+     * <p>The label rides in the OPEN frame's payload, which was previously always empty — so an
+     * empty label means exactly what OPEN has always meant (the default target) and a peer that
+     * predates named targets is unaffected. This is what lets one session forward more than one
+     * service: alt-p2p-lore-identity needs the CLI to reach both {@code loreserver} and the
+     * identity provider, and a second {@link com.alterante.p2p.net.PeerConnection} would cost
+     * another socket, coordination session and hole punch.
+     */
+    public MuxStream open(String target) throws IOException {
         int id = nextId.getAndIncrement();
-        MuxStream s = new MuxStream(id);
+        MuxStream s = new MuxStream(id, target);
         streams.put(id, s);
-        writeFrame(OPEN, id, null, 0, 0);
+        byte[] label = target == null || target.isEmpty()
+                ? null : target.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        writeFrame(OPEN, id, label, 0, label == null ? 0 : label.length);
         return s;
     }
 
@@ -125,7 +141,9 @@ public class StreamMux implements Closeable {
                 }
                 switch (type) {
                     case OPEN -> {
-                        MuxStream s = new MuxStream(id);
+                        String target = payload == null ? ""
+                                : new String(payload, java.nio.charset.StandardCharsets.UTF_8);
+                        MuxStream s = new MuxStream(id, target);
                         streams.put(id, s);
                         Consumer<MuxStream> h = onStream;
                         if (h != null) h.accept(s);
@@ -153,14 +171,20 @@ public class StreamMux implements Closeable {
     public final class MuxStream {
         private static final byte[] EOF = new byte[0];
         private final int id;
+        private final String target;
         private final BlockingQueue<byte[]> inQ = new LinkedBlockingQueue<>();
         private volatile boolean closed;
         private final In in = new In();
         private final Out out = new Out();
 
-        MuxStream(int id) { this.id = id; }
+        MuxStream(int id) { this(id, ""); }
+
+        MuxStream(int id, String target) { this.id = id; this.target = target == null ? "" : target; }
 
         public int id() { return id; }
+
+        /** Which of the acceptor's targets this stream is for; empty means the default. */
+        public String target() { return target; }
         public InputStream in() { return in; }
         public OutputStream out() { return out; }
 

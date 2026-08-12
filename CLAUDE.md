@@ -82,7 +82,7 @@ src/main/java/com/alterante/p2p/
 - **TcpRelayClient** — TCP connect + HMAC auth + TLS-PSK handshake through proxy
 - **TcpFileSender/TcpFileReceiver** — Stream a single file over TLS with 64KB chunks, length-prefixed messages
 - **TcpDirectorySender/TcpDirectoryReceiver** — Multi-file (folder) batch over the TLS relay stream (stream counterpart of the Directory*; receiver also unifies single-file)
-- **net/tunnel/** — Generic TCP-over-P2P port-forwarding layer (library, no CLI command yet; built for [alt-p2p-lore](https://github.com/sync-different/alt-p2p-lore)). `Tunnels.carrier()` bridges a connected `PeerConnection` to a `BytePipe` — `DirectBytePipe` over a fresh `ReliableChannel` (direct UDP) or `RelayBytePipe` over the relay's TLS streams. `StreamMux` multiplexes many logical streams over the one pipe (frame: `type(1)|streamId(4)|length(4)|payload`; OPEN/DATA/CLOSE; initiator-assigned ids). `ForwardListener` (local port → new stream per accept) and `ForwardConnector` (inbound stream → TCP connect to a local target) with `Bridge` splicing socket↔stream both ways
+- **net/tunnel/** — Generic TCP-over-P2P port-forwarding layer (library, no CLI command yet; built for [alt-p2p-lore](https://github.com/sync-different/alt-p2p-lore)). `Tunnels.carrier()` bridges a connected `PeerConnection` to a `BytePipe` — `DirectBytePipe` over a fresh `ReliableChannel` (direct UDP) or `RelayBytePipe` over the relay's TLS streams. `StreamMux` multiplexes many logical streams over the one pipe (frame: `type(1)|streamId(4)|length(4)|payload`; OPEN/DATA/CLOSE; initiator-assigned ids). **OPEN may name a target** (see "Named Tunnel Targets"). `ForwardListener` (local port → new stream per accept, optionally for a named target) and `ForwardConnector` (inbound stream → TCP connect to the named or default local target) with `Bridge` splicing socket↔stream both ways
 
 ### Packet Format
 
@@ -188,6 +188,28 @@ When hole punching fails (symmetric-to-symmetric NAT), peers can fall back to TC
 - Performance: ~15 MB/s via TCP relay (28x faster than UDP relay's 530 KB/s), compared to ~5 MB/s SCP to the same VPS.
 - Stream protocol: length-prefixed messages `type(1B) + length(4B BE) + payload`. Types: AUTH, AUTH_OK, FILE_OFFER, FILE_ACCEPT, DATA (64KB), COMPLETE, VERIFIED.
 
+### Named Tunnel Targets (v0.7.0)
+
+One session can forward **several** host services. `StreamMux.open(target)` puts a UTF-8 label in the
+OPEN frame's payload — a field that already existed and was **always empty**, so an empty payload
+still means what OPEN always meant: the acceptor's default target. `MuxStream.target()` exposes it,
+and `ForwardConnector` gained a `label -> host:port` map alongside a default.
+
+Why: `alt-p2p-lore-identity` requires a lore client to reach **both** `loreserver` and an identity
+provider. A second `PeerConnection` per service would cost another socket, coordination session and
+hole punch on a host designed to idle for hours.
+
+- **An unknown label is refused, not defaulted.** Routing identity traffic into loreserver would be
+  far harder to diagnose than a closed stream.
+- **Wire compatibility is pinned by a test.** `MuxTargetRoutingTest` asserts an unlabelled OPEN is
+  exactly `type|id|len=0` with no payload. This matters because consumers can be on different
+  versions — `alt-p2p-bbs` (telnet BBS over the same tunnel) and `alt-p2p-lore` are shipped
+  separately, and neither sends a label unless asked to.
+- Verified against both consumers: alt-p2p-bbs's suite passes unchanged, and a live BBS telnet
+  session through the tunnel returned output **byte-identical** to a direct connection.
+
+Exposed by alt-p2p-lore as `serve --identity-port` / `connect --identity-port`.
+
 ### Relay Stale-Peer Pairing (v0.6.1)
 
 `TcpRelayServer` matches two authenticated connections by session id and splices them. Until 0.6.1 its
@@ -265,6 +287,9 @@ Events: `status`, `file_info`, `progress`, `complete`, `error`, `log`. Folder tr
   are untouched and there is no protocol change, so a 0.6.1 relay serves 0.5.0/0.6.0 peers unchanged and
   only the coordinator needs the new jar. Deployed to demo7 2026-08-10 (0.5.0 → 0.6.1, verified by the
   reaper firing at 30s).
+- **Named tunnel targets** (v0.7.0): one mux carries several forwarded services — see above. Additive
+  and wire-compatible; **`alt-p2p-lore` and `alt-p2p-bbs` both shade 0.7.0-SNAPSHOT**, so bumping here
+  means bumping `<alt-p2p.version>` in both and rebuilding their fat jars.
 - **Deferred (L2)**: robust in-run reconnect across symmetric NAT / relay (coord dead-peer eviction + peer-id re-register, relay re-pair)
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for full design documentation.

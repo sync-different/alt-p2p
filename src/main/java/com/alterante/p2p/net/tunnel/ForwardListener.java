@@ -22,13 +22,24 @@ public class ForwardListener implements Closeable {
     private static final Logger log = LoggerFactory.getLogger(ForwardListener.class);
 
     private final StreamMux mux;
+    private final String target;
     private final ServerSocket server;
     private final ExecutorService exec =
             Executors.newCachedThreadPool(r -> { Thread t = new Thread(r, "fwd-listener"); t.setDaemon(true); return t; });
     private volatile boolean closed;
 
     public ForwardListener(StreamMux mux, String bindHost, int localPort) throws IOException {
+        this(mux, bindHost, localPort, "");
+    }
+
+    /**
+     * Forward to a named target on the host, rather than its default one — so several listeners can
+     * share one session, each pointed at a different remote service.
+     */
+    public ForwardListener(StreamMux mux, String bindHost, int localPort, String target)
+            throws IOException {
         this.mux = mux;
+        this.target = target == null ? "" : target;
         this.server = new ServerSocket();
         this.server.setReuseAddress(true);
         this.server.bind(new InetSocketAddress(bindHost, localPort));
@@ -44,7 +55,7 @@ public class ForwardListener implements Closeable {
             try {
                 Socket sock = server.accept();
                 sock.setTcpNoDelay(true);
-                StreamMux.MuxStream stream = mux.open();
+                StreamMux.MuxStream stream = mux.open(target);
                 Bridge.bridge(sock, stream, exec);
             } catch (IOException e) {
                 if (!closed) log.debug("accept failed: {}", e.getMessage());
