@@ -29,6 +29,9 @@ public class ReceiveBuffer {
     private static final int MIN_WINDOW = 32;
     private static final int DELAYED_ACK_THRESHOLD = 2;
     private static final long ACK_TIMER_MS = 10;
+    /** While a gap remains buffered but no new packets arrive, re-send a SACK at most this often to
+     *  keep the sender's loss signal alive without flooding the link. See {@link #shouldSendAck}. */
+    private static final long GAP_PERSIST_ACK_MS = 200;
 
     /** How many consecutive in-order deliveries before we grow the window. */
     private static final int GROW_THRESHOLD = 128;
@@ -43,6 +46,10 @@ public class ReceiveBuffer {
     private int packetsSinceLastAck;
     private long lastAckTimeMs;
     private boolean gapDetected;
+    /** A duplicate/old packet arrived — force an immediate ACK so the sender learns our
+     *  true cumulative ACK. Without this, a retransmit of data we already hold gets silently
+     *  dropped and the sender never advances its base (see alt-p2p #121). */
+    private boolean duplicateReceived;
 
     // Adaptive window state
     private int maxWindow = INITIAL_WINDOW;
@@ -60,8 +67,12 @@ public class ReceiveBuffer {
      * @return list of contiguous packets now deliverable (in order), or empty if buffered/duplicate
      */
     public List<DeliveredPacket> deliver(int seq, byte[] payload) {
-        // Duplicate or old packet
+        // Duplicate or old packet: we already have everything up to expectedSeq. The sender is
+        // retransmitting because it never saw our ACK advance — reply immediately with our current
+        // cumulative ACK so it can advance its base. (A duplicate is not a gap: gapDetected stays
+        // false, but we must still ACK.)
         if (SlidingWindow.seqBefore(seq, expectedSeq)) {
+            duplicateReceived = true;
             return Collections.emptyList();
         }
 
@@ -148,8 +159,17 @@ public class ReceiveBuffer {
      * Whether the receiver should send an ACK now.
      */
     public boolean shouldSendAck(long nowMs) {
-        if (packetsSinceLastAck == 0) return false;
         if (gapDetected) return true;
+        if (duplicateReceived) return true;
+        // Persist the loss signal: while a gap is still buffered, keep re-sending SACKs on the
+        // ack timer even when no NEW packets arrive. Otherwise, once packetsSinceLastAck falls to
+        // 0 (the sender's window is full and it has stopped sending new data), the receiver goes
+        // silent and the sender never gets a fresh gap signal — recovery then relies solely on RTO,
+        // and if the sender's window is also frozen (advertisedWindow shrank to <= 0 under the
+        // buffered gap) both directions deadlock and the transfer hangs. Re-SACKing the open gap
+        // keeps SACK-retransmit firing until it fills. See alt-p2p #118 / alt-p2p-lore-ui #117.
+        if (!outOfOrder.isEmpty() && (nowMs - lastAckTimeMs) >= GAP_PERSIST_ACK_MS) return true;
+        if (packetsSinceLastAck == 0) return false;
         if (packetsSinceLastAck >= DELAYED_ACK_THRESHOLD) return true;
         if ((nowMs - lastAckTimeMs) >= ACK_TIMER_MS) return true;
         return false;
@@ -162,6 +182,7 @@ public class ReceiveBuffer {
         packetsSinceLastAck = 0;
         lastAckTimeMs = nowMs;
         gapDetected = false;
+        duplicateReceived = false;
     }
 
     /** Available receiver window (in packets). */

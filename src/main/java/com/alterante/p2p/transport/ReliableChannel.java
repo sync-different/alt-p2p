@@ -74,7 +74,21 @@ public class ReliableChannel {
     private long totalPacketsReceived;
     private long totalRetransmissions;
     private long totalSacksReceived;
+    private long totalSacksSent;
     private long totalTicks;
+
+    // Data-progress watchdog (distinct from the PacketRouter's packet-level keepalive check).
+    // A wedged reliable stream (an unrecoverable receive gap, or un-acked in-flight data that the
+    // peer never ACKs) still exchanges keepalives, so the packet-level dead check never fires and
+    // the transfer hangs indefinitely. We track the last forward progress (in-order delivery OR a
+    // cumulative-ACK advance) and, if there is pending work but no progress for STALL_TIMEOUT_MS,
+    // declare the stream stalled: log the full transport state and tear the connection down so the
+    // caller fails fast and can reconnect, instead of hanging forever. See alt-p2p #119 / #120.
+    private static final long DEFAULT_STALL_TIMEOUT_MS = 30_000;
+    private volatile long stallTimeoutMs = DEFAULT_STALL_TIMEOUT_MS;
+    private volatile long lastProgressMs = System.currentTimeMillis();
+    private volatile boolean stalled;
+    private volatile Runnable onStall;
 
     /** Parsed DATA packet payload. */
     public record DataPayload(int chunkIndex, long byteOffset, byte[] data) {}
@@ -150,6 +164,23 @@ public class ReliableChannel {
     /** Set callback for when all in-flight packets are acknowledged. */
     public void onAllAcked(Runnable handler) {
         this.onAllAcked = handler;
+    }
+
+    /**
+     * Set a callback fired once if the reliable stream stalls (pending work but no forward
+     * progress for {@link #STALL_TIMEOUT_MS}). The carrier uses this to close its byte pipe so a
+     * blocked reader unblocks and the tunnel tears down, rather than hanging forever.
+     */
+    public void onStall(Runnable handler) {
+        this.onStall = handler;
+    }
+
+    /**
+     * Override the no-progress stall deadline (default 30s). The carrier can shorten this for a
+     * more responsive tunnel teardown; tests use a small value to exercise the watchdog quickly.
+     */
+    public void setStallTimeoutMs(long ms) {
+        this.stallTimeoutMs = ms;
     }
 
     /**
@@ -238,6 +269,7 @@ public class ReliableChannel {
         }
 
         List<ReceiveBuffer.DeliveredPacket> delivered = recvBuffer.deliver(seq, payload);
+        if (!delivered.isEmpty()) lastProgressMs = System.currentTimeMillis(); // watchdog: forward progress
 
         // Deliver data to the file transfer layer
         if (onDataReceived != null) {
@@ -274,6 +306,7 @@ public class ReliableChannel {
 
             // Forward progress: cumulative ACK advanced (real, in-order delivery).
             if (newBase != oldBase) {
+                lastProgressMs = now; // watchdog: forward progress
                 int ackedSeq = sack.cumulativeAck();
                 if (!sendWindow.wasRetransmitted(ackedSeq)) {
                     long sendTime = sendWindow.getSendTime(ackedSeq);
@@ -357,6 +390,47 @@ public class ReliableChannel {
             sendSack();
             recvBuffer.ackSent(now);
         }
+
+        // Data-progress watchdog: fires once if there is pending work (un-acked in-flight data
+        // and/or a buffered receive gap) but no forward progress for STALL_TIMEOUT_MS. Distinct
+        // from the router's packet keepalive, which stays satisfied even when the stream is wedged.
+        // Opt-in per carrier via onStall(): the tunnel enables it (a stalled stream must tear down
+        // and reconnect); file transfer and the reliability unit tests do not, so their behaviour
+        // and their own timeouts are unchanged.
+        if (onStall != null && !stalled && !closed) {
+            int inflight;
+            windowLock.lock();
+            try { inflight = sendWindow.inflightCount(); } finally { windowLock.unlock(); }
+            int buffered = recvBufferInitialized ? recvBuffer.bufferedCount() : 0;
+            if ((inflight > 0 || buffered > 0) && (now - lastProgressMs) >= stallTimeoutMs) {
+                stalled = true;
+                log.warn("Reliable-stream STALL: no progress for {}ms with pending work (inflight={}, buffered={}) — {}",
+                        now - lastProgressMs, inflight, buffered, debugState());
+                Runnable r = onStall;
+                if (r != null) {
+                    try { r.run(); } catch (RuntimeException e) { log.warn("onStall handler threw: {}", e.getMessage()); }
+                }
+                router.requestStop("reliable-stream data stall");
+            }
+        }
+    }
+
+    /** One-line transport-state snapshot for stall diagnosis (#120). */
+    public String debugState() {
+        windowLock.lock();
+        try {
+            return String.format(
+                "send[base=%d next=%d inflight=%d cwnd=%d recvWin=%d rto=%dms srtt=%.0fms] "
+                + "recv[expected=%d buffered=%d advWin=%d] stats[sent=%d recv=%d retx=%d sacksRx=%d sacksTx=%d ticks=%d]",
+                sendWindow.baseSeq(), sendWindow.nextSeq(), sendWindow.inflightCount(),
+                congestion.windowSize(), receiverWindow, rttEstimator.rto(), rttEstimator.srtt(),
+                recvBufferInitialized ? recvBuffer.expectedSeq() : -1,
+                recvBufferInitialized ? recvBuffer.bufferedCount() : 0,
+                recvBufferInitialized ? recvBuffer.advertisedWindow() : -1,
+                totalPacketsSent, totalPacketsReceived, totalRetransmissions, totalSacksReceived, totalSacksSent, totalTicks);
+        } finally {
+            windowLock.unlock();
+        }
     }
 
     /**
@@ -388,6 +462,7 @@ public class ReliableChannel {
 
     private void sendSack() {
         try {
+            totalSacksSent++;
             SackInfo sack = recvBuffer.generateSack();
             byte[] payload = sack.encode();
             Packet pkt = new Packet(PacketType.SACK, payload);

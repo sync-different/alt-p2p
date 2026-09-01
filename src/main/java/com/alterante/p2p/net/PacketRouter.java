@@ -105,6 +105,16 @@ public class PacketRouter {
         }
     }
 
+    /**
+     * Ask the receive loop to exit, called from WITHIN the loop thread (e.g. the reliable-channel
+     * stall watchdog in the tick callback). Just clears the running flag — the loop finishes the
+     * current iteration and exits; unlike {@link #stop()} it does not join the thread to itself.
+     */
+    public void requestStop(String reason) {
+        log.warn("PacketRouter stop requested: {}", reason);
+        running = false;
+    }
+
     /** Block until the receive loop exits (connection dies or stop called). */
     public void awaitStop() throws InterruptedException {
         if (receiveThread != null) {

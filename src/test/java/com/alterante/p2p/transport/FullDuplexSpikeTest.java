@@ -89,6 +89,62 @@ class FullDuplexSpikeTest {
         runFullDuplex("5% loss/duplex", 1500, 1000, 0.05, true, 60_000);
     }
 
+    /**
+     * Watchdog (alt-p2p #119): if the reliable stream wedges with pending work and no forward
+     * progress, the opt-in stall watchdog must fire onStall and stop the router, so a tunnel
+     * carrier tears down and reconnects instead of hanging forever. Here we hand the channel a
+     * connected-but-then-100%-lossy link so A's DATA can never be ACKed: progress halts, and the
+     * watchdog (shortened to ~1s) must trip. File transfer and the reliability tests don't set
+     * onStall, so their behaviour is unchanged.
+     */
+    @Test
+    void stallWatchdogFiresWhenWedged() throws Exception {
+        try (LossySocket socketA = new LossySocket();
+             LossySocket socketB = new LossySocket()) {
+            InetSocketAddress addrA = new InetSocketAddress("127.0.0.1", socketA.getLocalPort());
+            InetSocketAddress addrB = new InetSocketAddress("127.0.0.1", socketB.getLocalPort());
+            DtlsHandler dtlsA = new DtlsHandler(socketA, addrB, SESSION, PSK, true);
+            DtlsHandler dtlsB = new DtlsHandler(socketB, addrA, SESSION, PSK, false);
+            ExecutorService exec = Executors.newFixedThreadPool(3);
+            try {
+                Future<?> hA = exec.submit(() -> { dtlsA.handshake(); return null; });
+                Future<?> hB = exec.submit(() -> { dtlsB.handshake(); return null; });
+                hA.get(10, TimeUnit.SECONDS);
+                hB.get(10, TimeUnit.SECONDS);
+
+                PacketRouter routerA = new PacketRouter(dtlsA);
+                PacketRouter routerB = new PacketRouter(dtlsB);
+                ReliableChannel channelA = new ReliableChannel(routerA, 0xCAFE);
+                ReliableChannel channelB = new ReliableChannel(routerB, 0xBEEF);
+
+                CountDownLatch stalled = new CountDownLatch(1);
+                channelA.setStallTimeoutMs(1000);
+                channelA.onStall(stalled::countDown);
+
+                routerA.start();
+                routerB.start();
+
+                // Now black-hole everything: A's DATA leaves but no SACK can ever come back.
+                socketA.lossRate = 1.0;
+                socketB.lossRate = 1.0;
+
+                exec.submit(() -> {
+                    for (int i = 0; i < 64; i++) channelA.sendData(i, (long) i * 100, payloadFor(0, i, 100));
+                    return null;
+                });
+
+                assertTrue(stalled.await(15, TimeUnit.SECONDS), "stall watchdog did not fire");
+                // Watchdog requested router stop; it should wind down.
+                routerA.awaitStop();
+                assertFalse(routerA.isRunning(), "router should have stopped after stall");
+            } finally {
+                exec.shutdownNow();
+                dtlsA.close();
+                dtlsB.close();
+            }
+        }
+    }
+
     /** @param bidir if true both peers stream; if false only A->B (isolates full-duplex from loss handling). */
     private void runFullDuplex(String label, int N, int LEN, double lossRate, boolean bidir, long timeoutMs) throws Exception {
         final long perDirBytes = (long) N * LEN;

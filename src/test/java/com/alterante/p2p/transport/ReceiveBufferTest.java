@@ -70,6 +70,35 @@ class ReceiveBufferTest {
         assertEquals(1, buf.bufferedCount());
     }
 
+    /**
+     * Regression (alt-p2p #121): a duplicate/old packet MUST force an immediate ACK so the sender
+     * learns our true cumulative ACK. Without this, when a SACK is lost and the sender retransmits
+     * data we already hold, we drop it silently and never re-advertise our position — the sender's
+     * base stays stuck and, with its window frozen, both sides go silent forever (full-duplex
+     * deadlock observed in FullDuplexSpikeTest at a window boundary).
+     */
+    @Test
+    void duplicateForcesAck() {
+        ReceiveBuffer buf = new ReceiveBuffer(0);
+        buf.deliver(0, new byte[]{});
+        buf.deliver(1, new byte[]{});   // expected now 2
+        buf.ackSent(100);
+        assertFalse(buf.shouldSendAck(100), "no pending ACK after ackSent");
+
+        // Sender retransmits seq 1 (a SACK advancing our cumAck was lost) — we already have it.
+        List<ReceiveBuffer.DeliveredPacket> dup = buf.deliver(1, new byte[]{});
+        assertTrue(dup.isEmpty(), "duplicate delivers nothing");
+        assertTrue(buf.shouldSendAck(101), "duplicate must force an immediate ACK");
+
+        // The forced ACK carries our true cumulative ACK (1), which advances the sender's base.
+        SackInfo sack = buf.generateSack();
+        assertEquals(1, sack.cumulativeAck());
+        assertTrue(sack.ranges().isEmpty(), "no gap — this is a pure duplicate, not a reorder");
+
+        buf.ackSent(101);
+        assertFalse(buf.shouldSendAck(101), "duplicate ACK flag cleared after send");
+    }
+
     @Test
     void generateSackNoGaps() {
         ReceiveBuffer buf = new ReceiveBuffer(0);

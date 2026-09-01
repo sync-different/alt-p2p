@@ -39,6 +39,9 @@ public class DirectBytePipe implements BytePipe {
             byte[] d = dp.data();
             if (d != null && d.length > 0) recvQueue.offer(d);
         });
+        // Watchdog: if the reliable stream wedges (stall detected), close this pipe so a reader
+        // blocked in recvQueue.take() unblocks (EOF) and the tunnel tears down instead of hanging.
+        channel.onStall(this::close);
     }
 
     @Override public InputStream in() { return in; }
